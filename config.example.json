@@ -1,0 +1,11 @@
+{
+  "port": 3188,
+  "primaryMode": false,
+  "qqIngressEnabled": false,
+  "specialistsEnabled": false,
+  "dshFallbackEnabled": false,
+  "dshPrimaryUrl": "http://127.0.0.1:3080",
+  "dshDirectorUrl": "http://127.0.0.1:3080",
+  "codexCommand": "codex",
+  "libraryPythonCommand": "python"
+}
