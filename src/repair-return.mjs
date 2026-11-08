@@ -24,6 +24,8 @@ export class RepairReturns {
     ); CREATE INDEX IF NOT EXISTS repair_returns_pending ON repair_returns(status, queuedAt);
     CREATE TABLE IF NOT EXISTS repair_return_deliveries (
       deliveryKey TEXT PRIMARY KEY, turnId TEXT NOT NULL, text TEXT NOT NULL, notifiedAt INTEGER NOT NULL
+    ); CREATE TABLE IF NOT EXISTS repair_input_receipts (
+      receiptKey TEXT PRIMARY KEY, notifiedAt INTEGER NOT NULL
     );`);
     const columns = new Set(this.db.prepare('PRAGMA table_info(repair_returns)').all().map(column => column.name));
     if (!columns.has('watcherKey')) this.db.exec('ALTER TABLE repair_returns ADD COLUMN watcherKey TEXT');
@@ -96,7 +98,19 @@ export class RepairReturns {
       const meta = payload.internal_chat_message_metadata_passthrough || {};
       if (payload.type === 'message' && payload.role === 'user') {
         const body = bodyOf(payload);
-        if (body.includes(row.text)) { userSeen = true; turnId = meta.turn_id || payload.turn_id || turnId || null; }
+        if (body.includes(row.text)) {
+          if(!userSeen){
+            const acknowledgment='Codex 修复窗口已收到你的原话，正在处理；最终回复会自动返回。';
+            const receivedTurn=meta.turn_id||payload.turn_id||turnId;
+            const receiptKey=`repair-window-received:${this.threadId}:${receivedTurn||row.watcherKey||row.id}`;
+            if(!this.db.prepare('SELECT 1 FROM repair_input_receipts WHERE receiptKey=?').get(receiptKey)) {
+              await this.notify(acknowledgment,receiptKey);
+              this.db.prepare('INSERT OR IGNORE INTO repair_input_receipts VALUES(?,?)').run(receiptKey,Date.now());
+            }
+            try{this.store.event?.(null,'repair.input-received',{watcherId:row.id});}catch{}
+          }
+          userSeen = true; turnId = meta.turn_id || payload.turn_id || turnId || null;
+        }
         continue;
       }
       if (payload.type !== 'task_complete' || !userSeen) continue;

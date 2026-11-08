@@ -6,8 +6,8 @@ const engineName = engine => engine==='codex'?'Codex':engine==='workbuddy'?'Work
 
 /** Owns exclusive phone-resource scheduling and periodic worker progress reports. */
 export class WorkerSupervision {
-  constructor({store,reports=()=>null,sessionTitleForTask,createDirector,stopping=()=>false,reconcileTask=()=>false,nativeSessions=()=>null,failTask=()=>{}}) {
-    Object.assign(this,{store,reports,sessionTitleForTask,createDirector,stopping,reconcileTask,nativeSessions,failTask});
+  constructor({store,reports=()=>null,sessionTitleForTask,createDirector,stopping=()=>false,reconcileTask=()=>false,nativeSessions=()=>null,failTask=()=>{},paused=()=>false}) {
+    Object.assign(this,{store,reports,sessionTitleForTask,createDirector,stopping,reconcileTask,nativeSessions,failTask,paused});
     this.reconciling=new Set();
     store.db.exec(`CREATE TABLE IF NOT EXISTS worker_supervision(
       taskId TEXT PRIMARY KEY REFERENCES tasks(id),lastScheduledAt TEXT,lastFinishedAt TEXT,
@@ -19,8 +19,8 @@ export class WorkerSupervision {
     if(task.engine!=='dsh' || !task.sessionId || task.role!=='worker' || this.reconciling.has(task.id))return false;
     const runStart=this.store.db.prepare("SELECT id,createdAt FROM events WHERE taskId=? AND type='task.started' ORDER BY id DESC LIMIT 1").get(task.id);
     if(!runStart)return false;
-    const last=this.store.db.prepare("SELECT id,createdAt FROM events WHERE taskId=? AND id>? AND type IN ('message','dsh.tool-activity','approval') ORDER BY id DESC LIMIT 1").get(task.id,runStart.id);
-    const lastAt=Date.parse(last?.createdAt||runStart.createdAt)||now;
+    const last=this.store.db.prepare("SELECT id,COALESCE(json_extract(data,'$.coalesced.lastSeenAt'),createdAt) createdAt FROM events WHERE taskId=? AND id>? AND type IN ('message','dsh.tool-activity','approval') ORDER BY id DESC LIMIT 1").get(task.id,runStart.id);
+    const lastAt=Math.max(Date.parse(last?.createdAt||runStart.createdAt)||now,Date.parse(this.store.eventJournal?.lastActivity(task.id))||0);
     if(now-lastAt<staleMs)return false;
     const key=`dsh-reconcile:${task.id}:${task.runVersion||0}`;
     const previous=Number(this.store.meta(key))||0;
@@ -52,6 +52,7 @@ export class WorkerSupervision {
     const tasks=this.store.db.prepare("SELECT * FROM tasks WHERE role='worker' AND status='running' ORDER BY createdAt").all();
     let queued=0;
     for(const task of tasks) {
+      if(this.paused(task))continue;
       if(task.engine==='dsh')await this.reconcileStaleDsh(task,{now});
       const latestTask=this.store.task(task.id);
       if(!latestTask || latestTask.status!=='running')continue;
@@ -105,7 +106,7 @@ export class WorkerSupervision {
         continue;
       }
       const reviewNote=progressStalled?`最近约 ${stalledMinutes} 分钟没有新的文字进展；本轮记录到 ${toolActivityCount} 次工具活动。这不足以判定任务卡死，请如实说目前看不到新结果并继续观察。`:'';
-      const prompt=`[内部工作回报]\n${JSON.stringify({kind:'progress',sessionName:this.sessionTitleForTask(task),engine:engineName(task.engine),status:'仍在执行',elapsedMinutes,latestProgress,...(progressStalled?{stalledMinutes,toolActivityCount,reviewNote}:{}),files:[]})}\n这是定期进度监督。${reviewNote?reviewNote+' ':''}用助手的语气简短告诉你承接会话名、已运行时间和目前进展；没有新进展时如实说明仍在执行、暂未收到更新，并说会继续跟进。不要提内部编号、项目路径或编造进度；不要重派任务、附文件或提问。`;
+      const prompt=`[内部工作回报]\n${JSON.stringify({kind:'progress',sessionName:this.sessionTitleForTask(task),engine:engineName(task.engine),status:'仍在执行',elapsedMinutes,latestProgress,...(progressStalled?{stalledMinutes,toolActivityCount,reviewNote}:{}),files:[]})}\n这是定期进度监督。${reviewNote?reviewNote+' ':''}用当前启用人设的语气简短告诉用户承接会话名、已运行时间和目前进展；没有新进展时如实说明仍在执行、暂未收到更新，并说会继续跟进。不要提内部编号、项目路径或编造进度；不要重派任务、附文件或提问。`;
       const bucket=Math.floor(now/intervalMs);
       const messageKey=`supervision:${task.id}:${task.runVersion||0}:${bucket}`;
       const reports=this.reportService;

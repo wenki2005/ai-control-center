@@ -1,5 +1,9 @@
 import { isInternalArtifact, isQqShareableArtifact } from './knowledge/share-policy.mjs';
 import { ensureDeliverableSchema,isDeclaredDeliverable } from './knowledge/task-deliverables.mjs';
+import { isInternalSession } from './observability/internal-sessions.mjs';
+import {progressRequestIsCurrent,isProgressReportKind} from './report-progress.mjs';
+import {reportFallback} from './report-fallback.mjs';
+import {refreshFileDelivery} from './hub/file-delivery.mjs';
 import { enqueueReportDelivery,enqueueNamedReportDelivery,reconcileNamedReportDelivery,reconcileAllNamedReportDeliveries,reportChunkRows,
   ensureReportDeliverySchema,persistNamedRequest,claimNamedRequest,settleNamedRequest,failNamedRequest,releaseNamedRequest,pendingNamedRequests } from './report-delivery.mjs';
 
@@ -13,6 +17,7 @@ export class Reports {
     ensureDeliverableSchema(store.db);
     store.db.exec(`CREATE TABLE IF NOT EXISTS return_reports(key TEXT PRIMARY KEY,taskId TEXT NOT NULL,snapshot TEXT NOT NULL,status TEXT NOT NULL,createdAt TEXT NOT NULL,directorTaskId TEXT,attempts INTEGER NOT NULL DEFAULT 0,updatedAt TEXT);
       `);
+    store.db.exec('CREATE INDEX IF NOT EXISTS return_reports_task_created ON return_reports(taskId,createdAt)');
     const columns=new Set(store.db.prepare('PRAGMA table_info(return_reports)').all().map(row=>row.name));
     const firstDeliverySchemaMigration=!columns.has('body');
     if(!columns.has('directorTaskId'))store.db.exec('ALTER TABLE return_reports ADD COLUMN directorTaskId TEXT');
@@ -44,30 +49,50 @@ export class Reports {
     if(this.narrator&&pendingNamedRequests(this.store).length)this.wakeAnnouncementWorker();
   }
   enqueue(task,key) {
-    if(this.messageRetracted(task?.id))return;
+    if(this.messageRetracted(task?.id,task))return;
     this.store.db.prepare("INSERT OR IGNORE INTO return_reports(key,taskId,snapshot,status,createdAt) VALUES(?,?,?,'pending',?)").run(key,task.id,JSON.stringify(task),this.store.now());
-    void this.flush();
+    // A caller can enqueue the next report in the tiny window after the
+    // current run has resolved but before flush() has released `busy`.  In
+    // that window a plain flush() call is ignored and `finished` still points
+    // at the previous run, so an immediate await can observe no new report.
+    // Chain the next flush behind the current one and let the scheduler tick
+    // after the release, keeping the durable queue authoritative.
+    if(this.busy) {
+      const previous=this.finished;
+      this.finished=Promise.resolve(previous).then(()=>new Promise(resolve=>{
+        const schedule=()=>{
+          if(this.stopping){resolve();return;}
+          if(this.busy){setTimeout(schedule,0);return;}
+          Promise.resolve(this.flush()).then(resolve);
+        };
+        schedule();
+      }));
+    } else void this.flush();
   }
   async announce({task,kind='status-update',situation='',dedupe,artifacts=[]}={}) {
     if(this.stopping)throw new Error('汇报服务正在关闭');
+    if(kind==='dispatch-confirmation'){this.store.event(task?.id??null,'report.dispatch-hint',{kind});return '';}
     if(!this.narrator || !task)throw new Error('AI 汇报会话当前不可用');
-    if(this.messageRetracted(task.id))return '';
+    if(isProgressReportKind(kind)&&!this.progressRequestIsCurrent(task))return '';
+    if(this.messageRetracted(task.id,task))return '';
     if(!dedupe) {
       const outcome=await Promise.race([
         Promise.resolve().then(()=>this.narrator.summarize({task,artifacts,persona:this.personaForTask(task),kind,situation})).then(text=>({text})),
         this.shutdownSignal.then(()=>({stopped:true})),
       ]);
       if(outcome.stopped)return '';
-      if(this.stopping||this.messageRetracted(task.id))return '';
+      if(this.stopping||this.messageRetracted(task.id,task))return '';
       const text=String(outcome.text||'').trim();
+      if(kind==='screen-observation'&&/^NO_MESSAGE[。.!！]?$/i.test(text))throw Error('陪工作每张截图需要回复，请生成自然陪聊内容');
       if(!text)throw new Error('汇报会话没有生成可发送的内容');this.hub.say?.(text);return text;
     }
     const request=persistNamedRequest(this.store,{key:String(dedupe),task,kind,situation,artifacts});
     const existing=reconcileNamedReportDelivery(this.store,String(dedupe));
-    if(existing?.body) {settleNamedRequest(this.store,String(dedupe),existing.status);return existing.body;}
+    if(existing?.body) {if(!this.namedProgressRequestIsCurrent(String(dedupe)))return '';settleNamedRequest(this.store,String(dedupe),existing.status);return existing.body;}
     const flight=this.announcementFlights.get(String(dedupe));
     if(flight)return flight;
     const promise=this.runNamedRequest(String(dedupe)).then(body=>{
+      if(isProgressReportKind(kind)&&!this.progressRequestIsCurrent(task))return null;
       if(body&&!this.stopping)this.hub.say?.(body);
       return body;
     }).finally(()=>this.announcementFlights.delete(String(dedupe)));
@@ -83,14 +108,19 @@ export class Reports {
   }
   async runNamedRequest(key) {
     if(this.stopping)return null;
+    if(this.store.db.prepare('SELECT kind FROM report_requests WHERE key=?').get(key)?.kind==='dispatch-confirmation'){
+      settleNamedRequest(this.store,key,'suppressed');return null;
+    }
     const committed=reconcileNamedReportDelivery(this.store,key);
-    if(committed?.body) {settleNamedRequest(this.store,key,committed.status);return committed.body;}
+    if(committed?.body) {if(!this.namedProgressRequestIsCurrent(key))return null;settleNamedRequest(this.store,key,committed.status);return committed.body;}
     const claimed=claimNamedRequest(this.store,key);
     if(!claimed)return this.waitForNamedBody(key);
     try {
       const task=JSON.parse(claimed.request),artifacts=JSON.parse(claimed.artifacts||'[]');
-      if(this.messageRetracted(task.id)){settleNamedRequest(this.store,key,'suppressed');return null;}
-      if(claimed.kind==='progress-update'&&!this.progressRequestIsCurrent(task)) {
+      if(claimed.kind==='screen-observation'&&!this.hub.screenCompanionActive){settleNamedRequest(this.store,key,'suppressed');return null;}
+      if(claimed.kind==='agent-completion'&&!this.externalNoticeIsCurrent(key)) {settleNamedRequest(this.store,key,'suppressed');return null;}
+      if(this.messageRetracted(task.id,task)){settleNamedRequest(this.store,key,'suppressed');return null;}
+      if(['progress-update','director-delay'].includes(claimed.kind)&&!this.progressRequestIsCurrent(task)) {
         this.suppressStaleProgressRequest(key,claimed.taskId);return null;
       }
       const outcome=await Promise.race([
@@ -100,11 +130,15 @@ export class Reports {
       if(outcome.stopped) {releaseNamedRequest(this.store,key);return null;}
       const text=String(outcome.text||'').trim();
       if(this.stopping) {releaseNamedRequest(this.store,key);return null;}
-      if(this.messageRetracted(task.id)){settleNamedRequest(this.store,key,'suppressed');return null;}
-      if(claimed.kind==='progress-update'&&!this.progressRequestIsCurrent(task)) {
+      if(this.messageRetracted(task.id,task)){settleNamedRequest(this.store,key,'suppressed');return null;}
+      if(['progress-update','director-delay'].includes(claimed.kind)&&!this.progressRequestIsCurrent(task)) {
         this.suppressStaleProgressRequest(key,claimed.taskId);return null;
       }
       if(!text)throw new Error('汇报会话没有生成可发送的内容');
+      if(claimed.kind==='screen-observation'&&!this.hub.screenCompanionActive){settleNamedRequest(this.store,key,'suppressed');return null;}
+      if(claimed.kind==='agent-completion'&&!this.externalNoticeIsCurrent(key)) {settleNamedRequest(this.store,key,'suppressed');return null;}
+      if(claimed.kind==='screen-observation'&&/贴给助手|转交给助手|整理成一段.{0,12}(?:贴给|发给|转交)/u.test(text))throw Error('屏幕主管汇报混入内部交接措辞');
+      if(claimed.kind==='screen-observation'&&/^NO_MESSAGE[。.!！]?$/i.test(text))throw Error('陪工作每张截图需要回复，请生成自然陪聊内容');
       enqueueNamedReportDelivery({store:this.store,hub:this.hub,key,dedupe:key,text,taskId:claimed.taskId});
       const delivery=reconcileNamedReportDelivery(this.store,key);
       settleNamedRequest(this.store,key,delivery?.status||'queued');
@@ -122,7 +156,7 @@ export class Reports {
     while(Date.now()<until) {
       if(this.stopping)return null;
       const delivery=reconcileNamedReportDelivery(this.store,key);
-      if(delivery?.body)return delivery.body;
+      if(delivery?.body)return this.namedProgressRequestIsCurrent(key)?delivery.body:null;
       const request=this.store.db.prepare('SELECT status,nextAttemptAt,leaseUntil FROM report_requests WHERE key=?').get(key);
       if(!request||['uncertain','suppressed'].includes(request.status))return null;
       if((request.status==='pending'&&(!request.nextAttemptAt||request.nextAttemptAt<=this.store.now()))
@@ -152,11 +186,37 @@ export class Reports {
     catch { return null; }
   }
   progressRequestIsCurrent(task) {
-    const current=this.store.task(task?.id);
-    return Boolean(current&&current.status==='running'&&current.runVersion===task?.runVersion);
+    return progressRequestIsCurrent(this.store,task);
   }
-  messageRetracted(taskId) {
-    return !!taskId&&!!this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.message-retracted' LIMIT 1").get(taskId);
+  namedProgressRequestIsCurrent(key) {
+    const row=this.store.db.prepare('SELECT kind,request,taskId FROM report_requests WHERE key=?').get(key);
+    if(!row||!isProgressReportKind(row.kind))return true;
+    let task;try{task=JSON.parse(row.request);}catch{}
+    if(task?.id===row.taskId&&this.progressRequestIsCurrent(task))return true;
+    this.suppressStaleProgressRequest(key,row.taskId);return false;
+  }
+  messageRetracted(taskId,snapshot=null) {
+    if(!taskId)return false;
+    if(this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.message-retracted' LIMIT 1").get(taskId))return true;
+    const current=this.store.task(taskId);
+    if(current?.role==='worker') {
+      if(snapshot?.runVersion!==undefined&&current.runVersion!==snapshot.runVersion)return true;
+      if(snapshot&&['completed','failed','cancelled'].includes(snapshot.status)&&current.status!==snapshot.status)return true;
+      if(current.status!=='failed'&&this.store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='task_amendments'").get()&&this.store.db.prepare("SELECT 1 FROM task_amendments WHERE taskId=? AND status IN ('pending','claimed') LIMIT 1").get(taskId))return true;
+    }
+    return false;
+  }
+  reportIsCurrent(task) {
+    const key=this.reportKey(task);if(!key)return true;
+    const row=this.store.db.prepare('SELECT snapshot,status FROM return_reports WHERE key=?').get(key);
+    if(!row)return true;
+    if(row.status==='suppressed')return false;
+    try{const snapshot=JSON.parse(row.snapshot);return !this.messageRetracted(snapshot.id,snapshot);}catch{return false;}
+  }
+  externalNoticeIsCurrent(key) {
+    if(this.store.meta('agent-completions:enabled')!=='true')return false;
+    const rows=this.store.db.prepare('SELECT engine,sessionId FROM agent_completion_receipts WHERE batchKey=?').all(key);
+    return rows.length>0&&rows.every(row=>!isInternalSession(this.store,row.engine,row.sessionId));
   }
   suppressStaleProgressRequest(key,taskId) {
     settleNamedRequest(this.store,key,'suppressed');
@@ -167,7 +227,7 @@ export class Reports {
     // The director has finished writing its reply, but QQ may still be offline
     // or may reject the send. Keep this report queued until the durable QQ
     // outbox confirms the notification was actually accepted.
-    const changed=this.store.db.prepare("UPDATE return_reports SET status='queued',directorTaskId=?,updatedAt=? WHERE key=?").run(task.id,this.store.now(),key).changes;
+    const changed=this.store.db.prepare("UPDATE return_reports SET status='queued',directorTaskId=?,updatedAt=? WHERE key=? AND status!='suppressed'").run(task.id,this.store.now(),key).changes;
     if(changed)this.store.event(task.id,'report.delivered',{returnKey:key});
     return changed>0;
   }
@@ -179,14 +239,15 @@ export class Reports {
     return true;
   }
   recordFailure(row,directorTaskId,error) {
+    const source=JSON.parse(row.snapshot);
+    if(this.messageRetracted(row.taskId,source)){this.store.db.prepare("UPDATE return_reports SET status='suppressed',updatedAt=? WHERE key=?").run(this.store.now(),row.key);return;}
     const attempts=Number(row.attempts||0)+1;
     if(attempts<2) {
       this.store.db.prepare("UPDATE return_reports SET status='pending',directorTaskId=NULL,attempts=?,updatedAt=? WHERE key=?").run(attempts,this.store.now(),row.key);
       this.store.event(row.taskId,'report.retry-queued',{attempts,message:String(error?.message||error).slice(0,300)});
       return;
     }
-    const source=JSON.parse(row.snapshot),detail=String(source.result||source.error||'').replace(/\s+/g,' ').slice(0,360);
-    const text=`任务${source.status==='completed'?'已完成':'未能完成'}，但主管整理回报连续失败了。执行结果：${detail || '暂无可发送的结果摘要'}`;
+    const text=reportFallback(source,this.personaForTask(source));
     // Persist the fallback to the durable QQ outbox before settling the
     // report. The stable key makes this safe if the process dies between the
     // enqueue and the status update.
@@ -194,6 +255,23 @@ export class Reports {
     this.store.db.prepare("UPDATE return_reports SET status='fallback',directorTaskId=?,attempts=?,updatedAt=? WHERE key=?").run(directorTaskId||null,attempts,this.store.now(),row.key);
     this.hub.say?.(text);
     this.store.event(row.taskId,'report.fallback-delivered',{directorTaskId:directorTaskId||null});
+  }
+  queueExhaustedReturn(row,task,attempts) {
+    if(this.messageRetracted(row.taskId,task)){this.store.db.prepare("UPDATE return_reports SET status='suppressed',updatedAt=? WHERE key=?").run(this.store.now(),row.key);return;}
+    const text=reportFallback(task,this.personaForTask(task));
+    try{
+      enqueueReportDelivery({store:this.store,hub:this.hub,key:row.key,text,taskId:task.id});
+    }catch(error){
+      // Three persistence attempts (3,4,5) after the model budget is exhausted.
+      // Do not spend more model calls just because the outbox insert failed.
+      const status=attempts>=5?'uncertain':'pending';
+      this.store.db.prepare('UPDATE return_reports SET status=?,attempts=?,nextAttemptAt=?,updatedAt=? WHERE key=?')
+        .run(status,attempts,status==='pending'?new Date(Date.now()+60000).toISOString():null,this.store.now(),row.key);
+      this.store.event(row.taskId,'report.fallback-queue-error',{attempts,status});return;
+    }
+    this.store.db.prepare('UPDATE return_reports SET attempts=?,updatedAt=? WHERE key=?').run(attempts,this.store.now(),row.key);
+    this.hub.say?.(text);
+    this.store.event(task.id,'report.narration-exhausted',{attempts});
   }
   reconcile() {
     reconcileAllNamedReportDeliveries(this.store);
@@ -274,10 +352,13 @@ export class Reports {
         const row=this.store.db.prepare("SELECT * FROM return_reports WHERE status='pending' AND (nextAttemptAt IS NULL OR nextAttemptAt<=?) ORDER BY createdAt,rowid LIMIT 1").get(this.store.now());
         if(!row)break;
         this.store.db.prepare("UPDATE return_reports SET status='running' WHERE key=?").run(row.key);
+        let task={id:row.taskId,status:'unknown'};
         try {
-          const task=JSON.parse(row.snapshot),artifacts=await this.archive.list({taskId:task.id,includeText:true,maxTextLength:50000});
+          task=refreshFileDelivery(this.store,JSON.parse(row.snapshot));
+          if(Number(row.attempts)>=3){this.queueExhaustedReturn(row,task,Number(row.attempts)+1);continue;}
+          const artifacts=await this.archive.list({taskId:task.id,includeText:true,maxTextLength:50000});
           if(this.stopping)break;
-          if(this.messageRetracted(task.id)){this.store.db.prepare("UPDATE return_reports SET status='suppressed',updatedAt=? WHERE key=?").run(this.store.now(),row.key);continue;}
+          if(this.messageRetracted(task.id,task)){this.store.db.prepare("UPDATE return_reports SET status='suppressed',updatedAt=? WHERE key=?").run(this.store.now(),row.key);continue;}
           // hub.create() persists the director task before returning. If the
           // process dies before we persist directorTaskId below, adopt that
           // task on restart instead of creating a duplicate report turn.
@@ -298,7 +379,7 @@ export class Reports {
           // the final wording and may select only from the verified, familiar
           // file formats below. The supervisor task is deliberately compact.
           const outcomes=new Set(this.store.db.prepare('SELECT artifactId FROM task_deliverables WHERE taskId=?').all(task.id).map(row=>row.artifactId));
-          const shareable=task.role==='worker' ? artifacts.filter((artifact)=>
+          const shareable=task.role==='worker'&&!task.fileDelivery ? artifacts.filter((artifact)=>
             !String(artifact.sourcePath || '').startsWith('generated://') && !isInternalArtifact(artifact) && isQqShareableArtifact(artifact)
             && (outcomes.has(artifact.id) || isDeclaredDeliverable(task,artifact))
           ).sort((a,b)=>Number(outcomes.has(b.id)||isDeclaredDeliverable(task,b))-Number(outcomes.has(a.id)||isDeclaredDeliverable(task,a))).slice(0,12).map((artifact)=>{
@@ -322,12 +403,14 @@ export class Reports {
               artifacts:shareable,
               persona:this.personaForTask(task),
               kind:task.status==='completed'?'task-completion':'task-failure',
-              situation:task.status==='completed'
-                ? '工作会话已经结束；根据实际结果说明完成了什么，是否还有未完成部分，以及你接下来是否需要处理。'
-                : '工作会话没有完成；坦白说明失败或停在了哪里、已有的有效结果和是否需要你决定下一步。',
+              situation:task.fileDelivery
+                ? '按fileDelivery与result中的已核验交付状态，用当前人设自然汇报。sent表示QQ平台已确认；pending/sending表示尚待发送确认；unverified表示尚未核实。文件由统一交付流程处理，不再次发送；内部执行规则不要复述给用户。'
+                : task.status==='completed'
+                ? '工作会话已经结束；根据实际结果说明完成了什么，是否还有未完成部分，以及用户接下来是否需要处理。'
+                : '工作会话没有完成；坦白说明失败或停在了哪里、已有的有效结果和是否需要用户决定下一步。',
             });
             if(this.stopping)break;
-            if(this.messageRetracted(task.id)){this.store.db.prepare("UPDATE return_reports SET status='suppressed',updatedAt=? WHERE key=?").run(this.store.now(),row.key);continue;}
+            if(this.messageRetracted(task.id,task)){this.store.db.prepare("UPDATE return_reports SET status='suppressed',updatedAt=? WHERE key=?").run(this.store.now(),row.key);continue;}
             const text=String(summary||'').trim();
             if(!text)throw new Error('汇报会话没有生成可发送的内容');
             enqueueReportDelivery({store:this.store,hub:this.hub,key:row.key,text,taskId:task.id});
@@ -336,7 +419,7 @@ export class Reports {
             continue;
           }
           const report={returnKey:row.key,status:task.status==='completed'?'completed':'failed',request:String(task.prompt||'').slice(0,900),result:String(task.result||'').slice(0,1800),error:String(task.error||'').slice(0,500),files:shareable};
-          const prompt=`[内部工作回报]\n${JSON.stringify(report)}\n只整理这份结果，不要再派任务。用助手的语气简短告诉你结论和是否完成。标记 outcome 的成果文档和图片会自动发送；其他值得查看的附件只可从 files 挑选，输出一行 [HUB-FILES] 后接 JSON：{"artifactIds":["候选文件id"]}。不要复述内部编号、日志或长文件清单。`;
+          const prompt=`[内部工作回报]\n${JSON.stringify(report)}\n只整理这份结果，不要再派任务。用当前人设的称呼、语气和自然反应简短告诉用户结论和是否完成。标记 outcome 的成果文档和图片会自动发送；其他值得查看的附件只可从 files 挑选，输出一行 [HUB-FILES] 后接 JSON：{"artifactIds":["候选文件id"]}。不要复述内部编号、日志或长文件清单。`;
           const queued=await this.hub.create({engine:'dsh',prompt,role:'director'});
           if(this.stopping)break;
           this.store.event(row.taskId,'report.returned-to-director',{directorTaskId:queued.id,fileCount:shareable.length});
@@ -345,9 +428,14 @@ export class Reports {
           if(this.stopping) {
             break;
           }
+          if(this.messageRetracted(row.taskId,task)){this.store.db.prepare("UPDATE return_reports SET status='suppressed',updatedAt=? WHERE key=?").run(this.store.now(),row.key);continue;}
           this.store.event(row.taskId,'narrator.queue-error',{message:error.message});
           const attempts=Number(row.attempts||0)+1;
-          const status=attempts>=3?'uncertain':'pending';
+          if(attempts>=3){
+            this.queueExhaustedReturn(row,task,attempts);
+            continue;
+          }
+          const status='pending';
           const delayMs=Math.min(60000,1000*2**attempts);
           this.store.db.prepare('UPDATE return_reports SET status=?,attempts=?,nextAttemptAt=?,updatedAt=? WHERE key=?')
             .run(status,attempts,status==='pending'?new Date(Date.now()+delayMs).toISOString():null,this.store.now(),row.key);

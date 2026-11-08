@@ -1,11 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import{cancelDshTask}from'./dsh-cancellation.mjs';
+import { readFile, realpath, stat, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { normalizeVisualImage } from '../knowledge/document-reader.mjs';
 import WebSocket from 'ws';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute, relative, resolve, sep, join } from 'node:path';
 import { sessionDisplayName } from '../session-label.mjs';
+import {errorStrategy,retryAfterMs} from '../error-strategy.mjs';
 
 const STREAM_PATH = '/api/remote.mux';
 const RECONNECT_DELAYS_MS = Object.freeze([250, 750, 1500, 3000]);
+const LAUNCH_TOKEN_REFRESH_DELAYS_MS = Object.freeze([250, 750, 1500]);
 // The installed DSH profile has previously blocked its event loop for about
 // 63 seconds during a synchronous session-health scan. Allow that known pause
 // to finish; connection-refused errors still fail immediately.
@@ -28,10 +33,44 @@ function turnFailureMessage(reason) {
   return details.length ? `${details.join(', ')}: ${message}` : message;
 }
 
+export function sanitizeDshResponseText(text) {
+  const source=String(text ?? '').trim();
+  // OpenCode/DeepSeek can occasionally flatten the model's planning prose
+  // into the final text block.  It is recognizable by the meta-preface it
+  // uses ("User says…", "Just acknowledge…", "Let's craft…") followed by a
+  // short Chinese answer.  Keep the reasoning enabled, but expose only the
+  // final tail to Hub.
+  if(!/^(?:User says|The user|User asks|User wants)\b/i.test(source)
+    || !/(?:Just acknowledge|Respond\b|Maybe\b|Could mention|Let's craft|Short\.|Good\.)/i.test(source))return source;
+  const markers=[...source.matchAll(/(?:Good\.|Let's craft\s*:)/gi)];
+  const marker=markers.at(-1);
+  if(marker) {
+    const tail=source.slice(marker.index+marker[0].length).trim();
+    if(/[\u3400-\u9fff]/u.test(tail))return tail;
+  }
+  const quoted=[...source.matchAll(/["“「]([^"”」\n]{1,300})["”」]/g)]
+    .map(match=>match[1].trim()).filter(value=>/[\u3400-\u9fff]/u.test(value));
+  return quoted.at(-1) || source;
+}
+
 function responseText(record) {
   const message = record?.data?.message;
-  if (typeof message?.text === 'string') return message.text;
-  return (message?.content ?? []).filter((part) => part?.type === 'text').map((part) => part.text ?? '').join('');
+  // DSH may expose both a structured content array and a convenience `text`
+  // field.  The latter can be a flattened reasoning+answer snapshot; prefer
+  // structured text blocks so private reasoning never reaches Hub chat.
+  if (Array.isArray(message?.content)) {
+    return sanitizeDshResponseText(message.content
+      .filter((part) => part?.type === 'text')
+      .map((part) => part.text ?? '')
+      .join(''));
+  }
+  if (Array.isArray(message?.blocks)) {
+    return sanitizeDshResponseText(message.blocks
+      .filter((part) => part?.type === 'text')
+      .map((part) => part.text ?? '')
+      .join(''));
+  }
+  return typeof message?.text === 'string' ? sanitizeDshResponseText(message.text) : '';
 }
 
 function userMessageText(record) {
@@ -76,7 +115,11 @@ export async function imagePromptBlocks(paths, imageRoots) {
     total+=info.size;if(total>16*1024*1024)throw new Error('本条消息图片总量超过 16 MB');
     const bytes=await readFile(file),mediaType=imageMediaType(bytes);
     if(!mediaType)throw new Error('视觉附件不是受支持的 PNG、JPEG、WebP 或 GIF 图片');
-    blocks.push({type:'image',mediaType,data:bytes.toString('base64')});
+    const directory=await mkdtemp(join(tmpdir(),'dsh-visual-input-'));
+    try{
+      const normalized=await normalizeVisualImage(file,{outputDirectory:directory,expectedMimeType:mediaType});
+      blocks.push({type:'image',mediaType:'image/jpeg',data:(await readFile(normalized)).toString('base64')});
+    }finally{await rm(directory,{recursive:true,force:true});}
   }
   return blocks;
 }
@@ -111,31 +154,42 @@ export function createDshAdapter(options = {}) {
   async function ensureCookie({ refresh = false } = {}) {
     if (refresh) cookie = undefined;
     if (cookie) return cookie;
-    let launchToken;
-    if (typeof options.launchTokenProvider === 'function') {
-      try { launchToken = await options.launchTokenProvider(); }
-      catch { /* fall through to the configured token source */ }
+    for (let attempt = 0; ; attempt++) {
+      let launchToken;
+      if (typeof options.launchTokenProvider === 'function') {
+        try { launchToken = await options.launchTokenProvider(); }
+        catch { /* fall through to the configured token source */ }
+      }
+      launchToken ||= options.launchToken;
+      const launchTokenFile = options.launchTokenFile ?? defaultLaunchTokenFile;
+      if (!launchToken && launchTokenFile) {
+        try { launchToken = (await readFile(launchTokenFile, 'utf8')).trim(); }
+        catch (error) { if (error?.code !== 'ENOENT') throw error; }
+      }
+      if (!launchToken) return undefined;
+      const url = new URL('/', baseUrl);
+      url.searchParams.set('token', launchToken);
+      const response = await (options.fetch ?? fetch)(url, { redirect: 'manual', signal: AbortSignal.timeout(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) });
+      const cookies = response.headers.getSetCookie?.() ?? [response.headers.get('set-cookie')].filter(Boolean);
+      const sessionCookie = cookies.find((value) => value.includes('=') && !/^expires=/i.test(value));
+      if (sessionCookie) {
+        cookie = sessionCookie.split(';', 1)[0];
+        return cookie;
+      }
+      // The DSH web server authorizes loopback requests directly. In that case
+      // GET / serves the index without issuing the browser-only signed cookie.
+      if (response.ok) return undefined;
+      const delay = LAUNCH_TOKEN_REFRESH_DELAYS_MS[attempt];
+      // During a DSH restart, its listener can be back before the new launch
+      // URL reaches the discovery log. Re-read the token source with bounded
+      // backoff; a stale token commonly appears as 404 on newer web runtimes.
+      if (delay !== undefined && typeof options.launchTokenProvider === 'function'
+        && [401, 403, 404].includes(response.status)) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      throw new Error(`DSH launch-token exchange failed with HTTP ${response.status}`);
     }
-    launchToken ||= options.launchToken;
-    const launchTokenFile = options.launchTokenFile ?? defaultLaunchTokenFile;
-    if (!launchToken && launchTokenFile) {
-      try { launchToken = (await readFile(launchTokenFile, 'utf8')).trim(); }
-      catch (error) { if (error?.code !== 'ENOENT') throw error; }
-    }
-    if (!launchToken) return undefined;
-    const url = new URL('/', baseUrl);
-    url.searchParams.set('token', launchToken);
-    const response = await (options.fetch ?? fetch)(url, { redirect: 'manual', signal: AbortSignal.timeout(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) });
-    const cookies = response.headers.getSetCookie?.() ?? [response.headers.get('set-cookie')].filter(Boolean);
-    const sessionCookie = cookies.find((value) => value.includes('=') && !/^expires=/i.test(value));
-    if (sessionCookie) {
-      cookie = sessionCookie.split(';', 1)[0];
-      return cookie;
-    }
-    // The DSH web server authorizes loopback requests directly. In that case
-    // GET / serves the index without issuing the browser-only signed cookie.
-    if (response.ok) return undefined;
-    throw new Error(`DSH launch-token exchange failed with HTTP ${response.status}`);
   }
 
   function requestHeaders() {
@@ -171,7 +225,7 @@ export function createDshAdapter(options = {}) {
         // the exact same RPC body/id for one bounded transport retry only when
         // the caller explicitly verified that server capability.
         const transient = /fetch failed|timeout|aborted|ECONNRESET|ECONNREFUSED|UND_ERR_SOCKET|EPIPE/i.test(`${error?.message ?? ''} ${error?.code ?? ''}`);
-        if (endpoint === 'session/prompt' && options.promptRequestDedup === true && transportAttempt < 1 && transient) {
+        if (endpoint === 'session/prompt' && namedArgs?.request?.mode!=='steer' && options.promptRequestDedup === true && transportAttempt < 1 && transient) {
           transportAttempt++;
           continue;
         }
@@ -180,24 +234,40 @@ export function createDshAdapter(options = {}) {
       if (![401, 403].includes(response.status) || authAttempt || typeof options.launchTokenProvider !== 'function') break;
       authAttempt++;
     }
-    if (!response.ok) throw new Error(`DSH RPC ${endpoint} failed with HTTP ${response.status}`);
+    if (!response.ok) {
+      const error=new Error(`DSH RPC ${endpoint} failed with HTTP ${response.status}`);
+      error.httpStatus=response.status;
+      error.retryAfterMs=retryAfterMs(response.headers?.get?.('retry-after'));
+      if([425,429].includes(response.status))error.retrySafe=true;
+      if(response.status>=400&&response.status<500)error.receipt='not-received';
+      throw error;
+    }
     const envelope = await response.json();
     if (envelope?.type !== 'server-response' || envelope.rpcId !== rpcId || !envelope.result) {
       throw new Error(`DSH RPC ${endpoint} returned an invalid response`);
     }
-    if (!envelope.result.ok) throw new Error(envelope.result.error?.message ?? `DSH RPC ${endpoint} failed`);
+    if (!envelope.result.ok) {
+      const error=new Error(envelope.result.error?.message ?? `DSH RPC ${endpoint} failed`);
+      error.receipt='not-received';
+      throw error;
+    }
     return envelope.result.value;
     } catch (error) {
       const wrapped = new Error(`DSH RPC ${endpoint} (${Date.now()-startedAt}ms): ${safeMessage(error)}`, { cause: error });
       wrapped.endpoint = endpoint;
+      if(error?.receipt)wrapped.receipt=error.receipt;
+      for(const key of ['httpStatus','retryAfterMs','retrySafe'])if(error?.[key]!=null)wrapped[key]=error[key];
       throw wrapped;
     }
   }
 
   async function retryPreflight(operation) {
+    const started=Date.now();
     for(let attempt=0; ; attempt++) {
       try{return await operation();}catch(error){
-        if(attempt>=1 || !/timeout|aborted|fetch failed|ECONNRESET|ECONNREFUSED|HTTP 50[234]/i.test(String(error.message)))throw error;
+        const plan=errorStrategy(Object.assign(error,{idempotent:true}),{attempt});
+        if(!plan.autoRetry||Date.now()-started+plan.delayMs>180000){if(plan.transient)error.automaticRetriesExhausted=true;throw error;}
+        await new Promise(resolve=>setTimeout(resolve,plan.delayMs));
       }
     }
   }
@@ -247,14 +317,21 @@ export function createDshAdapter(options = {}) {
     throw error;
   }
 
-  function openSocket() {
-    if (socketReady) return socketReady;
+  async function openSocket() {
+    if (socketReady) {
+      const previous=socketReady;
+      await previous;
+      if(socket?.readyState===WebSocket.OPEN)return;
+      if(socketReady&&socketReady!==previous)return socketReady;
+      socketReady=undefined;
+    }
     const attempt = (async () => {
       await ensureCookie();
       return new Promise((resolve, reject) => {
       const url = new URL(STREAM_PATH, baseUrl);
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(url, { headers: cookie ? { Cookie: cookie } : {}, ...(options.websocketOptions ?? {}) });
+      let connectionHeartbeat;
       socket = ws;
       let settled = false;
       const timeout = setTimeout(() => {
@@ -270,6 +347,7 @@ export function createDshAdapter(options = {}) {
           if (ws.readyState === WebSocket.OPEN) ws.ping();
         }, 25000);
         heartbeat.unref?.();
+        connectionHeartbeat=heartbeat;
         resolve();
       });
       ws.once('error', (error) => {
@@ -281,7 +359,8 @@ export function createDshAdapter(options = {}) {
       });
       ws.on('message', (data) => handleSocketMessage(data));
       ws.on('close', () => {
-        if (heartbeat) clearInterval(heartbeat);
+        if (connectionHeartbeat) clearInterval(connectionHeartbeat);
+        if(socket!==ws)return;
         if (socket === ws) {
           socket = undefined;
           socketReady = undefined;
@@ -375,11 +454,13 @@ export function createDshAdapter(options = {}) {
     return item?.event?.seq ?? item?.seq;
   }
 
-  function emitToolProgress(record) {
+  function emitToolProgress(record,kind='tool-activity') {
     const now = Date.now();
-    if (now - (record.lastToolProgressAt ?? 0) < 2000) return;
-    record.lastToolProgressAt = now;
-    record.onEvent({ type: 'progress', kind: 'tool-activity' });
+    const key=kind==='tool-activity'?'lastToolProgressAt':'lastModelProgressAt';
+    if (now - (record[key] ?? 0) < 2000) return;
+    record[key] = now;
+    if(kind==='model-activity'&&!record.modelTimingSent){record.modelTimingSent=true;record.onEvent({type:'progress',kind:'model-started'});}
+    record.onEvent({ type: 'progress', kind });
   }
 
   function handleFollowItem(record, value) {
@@ -387,6 +468,7 @@ export function createDshAdapter(options = {}) {
       if (awaitsPrompt(record) && !record.followPromptMatched) return;
       record.progressed = true;
       const chunk = value.frame?.chunk;
+      if(chunk?.type==='reasoning-delta')emitToolProgress(record,'model-activity');
       const text = typeof chunk === 'string'
         ? chunk
         : chunk?.type === 'text-delta'
@@ -402,7 +484,7 @@ export function createDshAdapter(options = {}) {
         record.text = text === record.text || text.startsWith(record.text)
           ? text
           : record.text + text;
-        record.onEvent({ type: 'message', text: record.text });
+        record.onEvent({ type: 'message', text: record.text,stream:{kind:'snapshot',sessionId:record.sessionId,requestId:record.followRequestId||record.promptRequestId} });
       }
       return;
     }
@@ -410,9 +492,24 @@ export function createDshAdapter(options = {}) {
     const event = value.event;
     if (!event || event.seq <= record.lastSeq) return;
     record.lastSeq = event.seq;
+    if(event.type==='user/message') {
+      const rpcId=event.data?.source?.rpcId;
+      const receipt=typeof rpcId==='string'?record.steerReceipts?.get(rpcId):null;
+      if(receipt&&!receipt.matched){receipt.matched=true;receipt.resolve?.(true);}
+    }
     if (awaitsPrompt(record) && !record.followPromptMatched) {
+      // A native session can refuse a new turn before consuming user/message
+      // (for example a pre-existing blocked state). Do not wait forever for
+      // a marker that will never be emitted. Historical snapshots are already
+      // filtered above; require a live turn/start before accepting this failure.
+      if (record.busy && event.type === 'turn/start') record.unmatchedTurnStarted = true;
+      if (record.unmatchedTurnStarted && event.type === 'turn/end' && event.data?.reason?.kind === 'blocked') {
+        void fail(record, new Error('DSH 原生会话在接收本轮消息前已阻断（blocked）；未确认任务开始执行。'));
+        return;
+      }
       if (event.type !== 'user/message' || !matchesPrompt(record,{event})) return;
       record.followPromptMatched = true;
+      record.onEvent({type:'progress',kind:'prompt-received'});
       record.resolvePromptAccepted?.();
     }
     if (typeof event.type === 'string' && /tool|approval|question/i.test(event.type)) record.progressed = true;
@@ -427,18 +524,29 @@ export function createDshAdapter(options = {}) {
     if (event.type === 'assistant/message') {
       record.progressed = true;
       const text = responseText(event);
+      const usageEvidence=event.data?.usage?{usage:event.data.usage,usageId:`event:${event.seq}`,
+        ...(Number.isFinite(event.time)?{usageAt:new Date(event.time).toISOString()}:{}),usageScope:'request'}:{};
       if (text || event.data?.usage) {
-        if (text && (text !== record.text || event.data?.usage)) record.onEvent({ type: 'message', text: text || record.text, ...(event.data?.usage ? { usage: event.data.usage } : {}) });
-        else if (event.data?.usage) record.onEvent({ type: 'message', text: record.text, usage: event.data.usage });
-        if (text) record.text = text;
+        // Some native snapshots flatten reasoning before the visible answer
+        // into `message.text`. If streaming already supplied a visible answer
+        // and the snapshot ends with it, keep the streamed text instead of
+        // replacing it with the private prefix.
+        const visibleText=text && record.text && text.endsWith(record.text) && !text.startsWith(record.text)
+          ? record.text : text;
+        if (visibleText && (visibleText !== record.text || event.data?.usage)) record.onEvent({ type: 'message', text: visibleText,stream:{kind:'snapshot',sessionId:record.sessionId,requestId:record.followRequestId||record.promptRequestId}, ...usageEvidence });
+        else if (event.data?.usage) record.onEvent({ type: 'message', text: record.text, ...usageEvidence });
+        if (visibleText) record.text = visibleText;
       }
     } else if (event.type === 'turn/end') {
       record.busy = false;
       record.terminal = true;
       const reason = event.data?.reason;
-      if (reason?.kind === 'completed') record.onEvent({ type: 'completed', text: record.text });
+      const terminalIdentity=event.data?.turn!=null?{nativeTurnId:String(event.data.turn)}:{};
+      if (reason?.kind === 'completed') record.onEvent({ type: 'completed', text: record.text,...terminalIdentity });
       else if (!(record.cancelRequested && ['aborted', 'interrupted'].includes(reason?.kind))) record.onEvent({
-        type: 'failed', error: turnFailureMessage(reason),
+        type: 'failed', error: turnFailureMessage(reason),...terminalIdentity,
+        ...(Number.isInteger(reason?.error?.status??reason?.error?.statusCode)?{httpStatus:reason.error.status??reason.error.statusCode}:{}),
+        ...(retryAfterMs(reason?.error?.retryAfter??reason?.error?.headers?.['retry-after'])!=null?{retryAfterMs:retryAfterMs(reason.error.retryAfter??reason.error.headers?.['retry-after'])}:{}),
         ...(reason?.kind === 'error' && !record.progressed ? { retrySafe: true } : {}),
       });
       if (record.followStream) {
@@ -452,6 +560,12 @@ export function createDshAdapter(options = {}) {
 
   async function replaySnapshot(record, value, previousSeq) {
     let records = Array.isArray(value.records) ? value.records : [];
+    for(const item of records) {
+      const event=item?.event;
+      const rpcId=event?.type==='user/message'?event.data?.source?.rpcId:null;
+      const receipt=typeof rpcId==='string'?record.steerReceipts?.get(rpcId):null;
+      if(receipt&&!receipt.matched){receipt.matched=true;receipt.resolve?.(true);}
+    }
     const cursor = value.cursor ?? -1;
     if ((record.resumeFollow || awaitsPrompt(record)) && previousSeq < 0) {
       if (awaitsPrompt(record)) {
@@ -538,7 +652,7 @@ export function createDshAdapter(options = {}) {
     }
     if (eventName !== 'user-questions/request' && eventName !== 'approval/request') return;
     const matching = [...active.values()].filter((item) => item.busy);
-    const record = active.get(String(value.agentId)) ?? matching.find((item) => item.sessionId === value.agentId) ?? (matching.length === 1 ? matching[0] : undefined);
+    const record = active.get(String(value.agentId)) ?? matching.find((item) => item.sessionId === value.agentId) ?? (!value.agentId && matching.length === 1 ? matching[0] : undefined);
     if (!record) return;
     record.progressed = true;
     const eventId = value.eventId;
@@ -553,9 +667,9 @@ export function createDshAdapter(options = {}) {
       record.onEvent({
         type: 'approval', requestId, kind: 'question',
         question: isSecret
-          ? 'The engine is requesting a sensitive answer. Enter it only if you intend to share it with DSH.'
-          : questions.map((item) => `${multi ? `[${item.id}] ` : ''}${item.question}${item.detail ? `\n${item.detail}` : ''}`).join('\n\n') + (multi ? '\n\nReply with a JSON object keyed by question ID.' : ''),
-        options: isSecret || multi ? [] : questions.flatMap((item) => item.options ?? []).map((item) => item.label),
+          ? '引擎正在请求敏感信息。只有确认要把它交给 DSH 时才输入。'
+          : questions.map((item) => `${multi ? `[${item.id}] ` : ''}${item.question}${item.detail ? `\n${item.detail}` : ''}`).join('\n\n') + (multi ? '\n\n请按问题 ID 回复 JSON 对象。' : ''),
+        options: isSecret ? [] : questions.flatMap((item) => (item.options ?? []).map((option) => ({label: multi ? `[${item.id}] ${option.label}` : option.label, value: option.label, questionId: item.id}))),
         raw: { eventName, isSecret, questions: isSecret ? questions.map(({ id, isSecret: secret }) => ({ id, isSecret: secret })) : questions },
       });
     } else {
@@ -563,7 +677,7 @@ export function createDshAdapter(options = {}) {
       record.onEvent({
         type: 'approval', requestId, kind: 'tool',
         question: [req.toolName, req.displayReason?.en ?? req.reason].filter(Boolean).join(': ') || 'DSH requests permission to continue.',
-        options: ['approve once', 'deny'], raw: { eventName, request: req },
+        options: ['允许一次', '拒绝'], raw: { eventName, request: req },
       });
     }
   }
@@ -589,7 +703,9 @@ export function createDshAdapter(options = {}) {
       });
       outcome = { kind: 'result', value: { answers } };
     } else {
-      outcome = { kind: 'result', value: /^(approve|accept|allow|yes|y|同意|允许|批准|通过|是)$/i.test(String(answer)) ? 'allowed-once' : 'rejected' };
+      const decision=String(answer).trim();
+      if(!/^(approve(?: once)?|accept|allow|yes|y|同意|允许|批准|通过|是|deny|reject|no|n|拒绝|不允许|否)$/i.test(decision))throw Error('请明确选择允许一次或拒绝');
+      outcome = { kind: 'result', value: /^(approve(?: once)?|accept|allow|yes|y|同意|允许|批准|通过|是)$/i.test(decision) ? 'allowed-once' : 'rejected' };
     }
     await call('$events/result', { clientId: pending.clientId, eventId: pending.eventId, outcome });
     pendingQuestions.delete(requestId);
@@ -631,14 +747,22 @@ export function createDshAdapter(options = {}) {
   }
 
   async function ensureRecordStreams(record) {
-    await openSocket();
-    if (!adapter.eventStream) adapter.eventStream = openStream('$events', { args: {} });
-    record.streamIds.add(adapter.eventStream);
-    if (!record.followStream) {
-      record.followStream = openStream('session/follow', {
-        args: { request: { address: { kind: 'session', sessionId: record.sessionId }, assistantStream: true } },
-      });
-      record.streamIds.add(record.followStream);
+    for(let attempt=0;attempt<2;attempt++) {
+      await openSocket();
+      try {
+        if (!adapter.eventStream) adapter.eventStream = openStream('$events', { args: {} });
+        record.streamIds.add(adapter.eventStream);
+        if (!record.followStream) {
+          record.followStream = openStream('session/follow', {
+            args: { request: { address: { kind: 'session', sessionId: record.sessionId }, assistantStream: true } },
+          });
+          record.streamIds.add(record.followStream);
+        }
+        return;
+      }catch(error) {
+        if(attempt||!/DSH event stream is not connected/.test(String(error.message)))throw error;
+        socketReady=undefined;adapter.eventStream=null;record.followStream=null;record.streamIds.clear();
+      }
     }
   }
 
@@ -683,7 +807,16 @@ export function createDshAdapter(options = {}) {
         throw error;
       }
       assertTaskNotCancelled(task.id);
-      if (!adapter.eventStream) adapter.eventStream = openStream('$events', { args: {} });
+      if (!adapter.eventStream) {
+        try { adapter.eventStream = openStream('$events', { args: {} }); }
+        catch(error) {
+          if(!/DSH event stream is not connected/.test(String(error.message)))throw error;
+          socketReady=undefined;
+          await openSocketBeforeTask();
+          try { adapter.eventStream = openStream('$events', { args: {} }); }
+          catch(retryError){retryError.retryPreflightSafe=true;throw retryError;}
+        }
+      }
       const previous = active.get(task.id);
       if (previous?.followStream) {
         try { send({ type: 'cancel', streamId: previous.followStream }); } catch { }
@@ -695,7 +828,13 @@ export function createDshAdapter(options = {}) {
       if (task.sessionId && !task.reconnectOnly) {
         let listedCwd=sessionCwds.get(task.sessionId) || null;
         if(!listedCwd) {
-          const listing=await call('session/list',{_request:{}});
+          let listing;
+          try { listing=await retryPreflight(()=>call('session/list',{_request:{}})); }
+          catch(error){
+            // No prompt has been submitted: Hub may safely reconnect this run.
+            if(/fetch failed|timeout|ECONNRESET|ECONNREFUSED|HTTP (?:502|503|504)/i.test(String(error.message)))error.retryPreflightSafe=true;
+            throw error;
+          }
           listedCwd=listedSessionCwd(listing,task.sessionId);
           if(listedCwd)sessionCwds.set(task.sessionId,listedCwd);
         }
@@ -748,14 +887,14 @@ export function createDshAdapter(options = {}) {
         followRequestId:task.reconnectOnly ? task.followRequestId || null : typeof task.userText==='string'?randomUUID():null,
         followPromptMarker: task.reconnectOnly
           ? (typeof task.followPromptMarker === 'string' && task.followPromptMarker ? task.followPromptMarker : null)
-          : typeof task.userText==='string'?null:task.sessionId ? `[HUB-TASK ${String(task.id).replace(/[^\w-]/g,'').slice(0,80)}]` : null,
-        followPromptMatched: false, paging: false, liveBuffer: [],
+          : typeof task.userText==='string'?null:task.sessionId ? `[HUB-TASK ${String(task.id).replace(/[^\w-]/g,'').slice(0,72)}-run-${randomUUID().slice(0,12)}]` : null,
+        followPromptMatched: false, paging: false, liveBuffer: [],ownedRequestIds:new Set(),steerReceipts:new Map(),promptRequestId:randomUUID(),
       };
       if(!task.reconnectOnly)sessionCwds.set(record.sessionId,task.projectPath ?? task.cwd);
       active.set(task.id, record);
       await ensureRecordStreams(record);
       assertTaskNotCancelled(task.id);
-      onEvent({ type: 'session', sessionId: record.sessionId,...(record.followRequestId?{requestId:record.followRequestId}:{}),...(fallbackFromSessionId?{replacedMissingSession:true,previousSessionId:fallbackFromSessionId}:{}) });
+      onEvent({ type: 'session', sessionId: record.sessionId,createdByHub:!task.sessionId,accepted:record.followPromptMatched,requestId:task.reconnectOnly?record.followRequestId:record.followRequestId||record.promptRequestId,...(record.followPromptMarker?{promptMarker:record.followPromptMarker}:{}),...(fallbackFromSessionId?{replacedMissingSession:true,previousSessionId:fallbackFromSessionId}:{}) });
       if (task.reconnectOnly) return { sessionId: record.sessionId };
       // API-created DSH sessions otherwise inherit a generic system-prompt title.
       // Give them a stable, human-readable title so the same task is visible in
@@ -772,33 +911,89 @@ export function createDshAdapter(options = {}) {
         }
         sessionTitles.set(record.sessionId, title);
       }
-      const selection=task.model
-        ? {provider:task.provider ?? options.provider ?? 'deepseek-official',model:task.model}
-        : ['director','coordinator','reporter'].includes(task.role) ? options.supervisorSelection : null;
+      // Re-select the active provider for every reused session. A native DSH
+      // session persists its prior provider; leaving workers untouched makes a
+      // later OpenCode migration keep calling a removed `command` adapter and
+      // fail with NO_ADAPTER before the model request starts.
+      let selection=task.preserveNativeSession?null:task.model
+        ? {provider:task.provider ?? options.provider ?? 'opencode-go',model:task.model}
+        : options.supervisorSelection || null;
+      if(options.reasoningEffort&&!task.preserveNativeSession){
+        if(!selection){const projection=await call('session/projections',{request:{sessionId:record.sessionId}});selection=projection?.values?.modelSelection?.next||projection?.values?.modelSelection?.lastUsed;}
+        if(selection)selection={...selection,reasoningEffort:options.reasoningEffort};
+      }
       if(selection?.provider&&selection?.model) {
         const key=JSON.stringify(selection);
         if(sessionModels.get(record.sessionId)!==key) {
-          await call('session/selectModel',{request:{sessionId:record.sessionId,provider:selection.provider,model:selection.model}});
+          await retryPreflight(()=>call('session/selectModel',{request:{sessionId:record.sessionId,provider:selection.provider,model:selection.model,...(selection.reasoningEffort?{reasoningEffort:selection.reasoningEffort}:{})}}));
           sessionModels.set(record.sessionId,key);
         }
       }
+      // Persist initialization outside the user's message, before DSH assembles
+      // this request. The scoped companion plugin reads it as system/runtime
+      // context; prompt content remains the exact original text plus images.
+      if(task.prepareNativeSessionContext&&typeof options.companionReady==='function'&&!options.companionReady())throw Error('中枢人设与记忆插件尚未就绪；已阻止以通用空白助手接收用户消息，请修复插件后续接原会话。');
+      await task.prepareNativeSessionContext?.({sessionId:record.sessionId});
       record.busy = true;
       record.terminal = false;
       record.cancelRequested = false;
       try {
         const promptText=typeof task.userText==='string'?task.userText:record.followPromptMarker?`${record.followPromptMarker}\n${task.prompt}`:task.prompt;
-        await call('session/prompt', { request: {
-          requestId: record.followRequestId||randomUUID(), sessionId: record.sessionId, mode: 'queue', content: [{ type: 'text', text: promptText },...(typeof task.userText==='string'&&task.sessionContext?[{type:'text',text:'中枢上下文（独立于用户原话）：\n'+task.sessionContext}]:[]),...imageBlocks],
+        const requestId=record.followRequestId||record.promptRequestId;record.ownedRequestIds.add(requestId);
+        record.onEvent({type:'progress',kind:'prompt-submitting'});
+        const receipt=await call('session/prompt', { request: {
+          // Keep the supervisor's user turn verbatim. DSH stores every text
+          // block as part of the same user message, so metadata or memory here
+          // would visibly rewrite the user's words and pollute session history.
+          requestId, sessionId: record.sessionId, mode: 'queue', content: [{ type: 'text', text: promptText },...imageBlocks],
         } });
+        if(receipt?.accepted===true)record.onEvent({type:'progress',kind:'prompt-received'});
       } catch (error) {
         // The prompt RPC can lose its HTTP response after DSH has accepted the
         // user message. Reconcile only from the existing read-only follow
         // stream's task marker. Never replay the prompt on this ambiguous path.
-        if (await waitForPromptAcceptance(record)) return { sessionId: record.sessionId };
+        if (error.receipt!=='not-received' && await waitForPromptAcceptance(record)) return { sessionId: record.sessionId };
         record.busy = false;
+        if(error.receipt==='not-received'){
+          record.failed=true;
+          if(record.followStream){try{send({type:'cancel',streamId:record.followStream});}catch{}record.streamIds.delete(record.followStream);record.followStream=null;}
+        }
         throw error;
       }
       return { sessionId: record.sessionId };
+    },
+    async steer(task, text) {
+      const record=active.get(task.id);
+      if(!record?.busy||record.terminal||record.failed)return {accepted:false};
+      const requestId=randomUUID();record.ownedRequestIds.add(requestId);
+      // Keep steer receipt correlation independent from the primary turn's
+      // prompt filter; concurrent steer requests may be acknowledged out of order.
+      const receipt={matched:false,resolve:null};record.steerReceipts.set(requestId,receipt);
+      const waitForReceipt=async(timeoutMs)=>{
+        if(receipt.matched)return true;
+        return new Promise(resolve=>{
+          let timer;receipt.resolve=value=>{clearTimeout(timer);receipt.resolve=null;resolve(value);};
+          timer=setTimeout(()=>{receipt.resolve=null;resolve(false);},timeoutMs);
+        });
+      };
+      try {
+        const result=await call('session/prompt',{request:{requestId,sessionId:record.sessionId,mode:'steer',content:[{type:'text',text:String(text)}]}},undefined,options.steerTimeoutMs||3000);
+        if(result?.accepted===true)return {accepted:true,sessionId:record.sessionId,requestId,receipt:'rpc-accepted'};
+        if(result?.accepted===false){const error=new Error('DSH did not accept this interjection');error.receipt='not-received';throw error;}
+        if(await waitForReceipt(options.steerReceiptTimeoutMs??500))return {accepted:true,sessionId:record.sessionId,requestId,receipt:'event-confirmed'};
+        const error=new Error('DSH steer RPC response did not confirm acceptance');error.requestId=requestId;error.receipt='unknown';throw error;
+      } catch(error) {
+        if(error?.receipt==='unknown'&&receipt.matched)return {accepted:true,sessionId:record.sessionId,requestId,receipt:'event-confirmed'};
+        if(await waitForReceipt(options.steerReceiptTimeoutMs??500))
+          return {accepted:true,sessionId:record.sessionId,requestId,receipt:'event-confirmed'};
+        // An HTTP/RPC rejection is definitive. A transport/abort failure is
+        // ambiguous: the server may have committed before the response was lost.
+        error.requestId=requestId;
+        error.receipt=error.receipt==='not-received'?'not-received':'unknown';
+        throw error;
+      } finally {
+        record.steerReceipts.delete(requestId);
+      }
     },
     async respond(task, approval, answer) {
       const record = active.get(task.id);
@@ -813,11 +1008,13 @@ export function createDshAdapter(options = {}) {
       record.followRequestId=typeof record.task.userText==='string'?randomUUID():null;
       record.followPromptMarker=record.followRequestId?null:`[HUB-TASK ${String(task.id).replace(/[^\w-]/g,'').slice(0,72)}-answer-${randomUUID().slice(0,8)}]`;
       record.followPromptMatched=false;
+      record.unmatchedTurnStarted=false;
       let result;
       try {
         const answerText=record.followRequestId?String(answer??''):`${record.followPromptMarker}\n${String(answer ?? '')}`;
+        const requestId=record.followRequestId||randomUUID();record.ownedRequestIds.add(requestId);
         result = await call('session/prompt', { request: {
-          requestId: record.followRequestId||randomUUID(), sessionId: record.sessionId, mode: 'queue', content: [{ type: 'text', text: answerText }],
+          requestId, sessionId: record.sessionId, mode: 'queue', content: [{ type: 'text', text: answerText }],
         } });
       } catch (error) {
         if (await waitForPromptAcceptance(record)) return { sessionId: record.sessionId };
@@ -829,11 +1026,19 @@ export function createDshAdapter(options = {}) {
     async cancel(task) {
       cancelledTasks.add(task.id);
       const record = active.get(task.id);
-      if (!record) return;
-      record.cancelRequested = true;
-      record.busy = false;
-      await call('session/cancel', { request: { sessionId: record.sessionId } });
+      return cancelDshTask({task,record,call,timeoutMs:options.cancelTimeoutMs||8000});
     },
+    release(task) {
+      const record=active.get(task.id);
+      if(!record)return true;
+      if(record.busy||(!record.terminal&&!record.failed)||[...pendingQuestions.values()].some(p=>p.record===record))return false;
+      if(record.followStream)return false;
+      // The remaining stream id is the adapter's shared approval channel.
+      // Drop this task's reference without cancelling that shared channel.
+      record.streamIds.clear();active.delete(task.id);cancelledTasks.delete(task.id);return true;
+    },
+    diagnostics(){return {retainedTaskRecords:active.size,pendingQuestions:pendingQuestions.size,cachedSessionDirectories:sessionCwds.size};},
+    hasTask(task){return active.has(task.id);},
     async close() {
       if (closed) return;
       closed = true;
@@ -851,6 +1056,7 @@ export function createDshAdapter(options = {}) {
       workspaces.clear();
       sessionTitles.clear();
       sessionModels.clear();
+      sessionCwds.clear();
     },
   };
   return adapter;

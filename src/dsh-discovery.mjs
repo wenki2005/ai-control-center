@@ -42,6 +42,31 @@ export function discoverLocalDsh({ logPath = (process.env.DSH_LOG_PATH || ''), a
   return null;
 }
 
+/**
+ * A local DSH build can announce a LAN URL even when its web server is bound
+ * only to loopback. Prefer the loopback endpoint only after it responds; keep
+ * the discovered launch token in memory and retain the announced URL when the
+ * loopback listener is unavailable.
+ */
+export async function preferReachableLoopback(discovered, {
+  fetchImpl = fetch,
+  url = 'http://127.0.0.1:3080/',
+  timeoutMs = 1500,
+} = {}) {
+  if (!discovered) return null;
+  try {
+    const response = await fetchImpl(url, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (response.status < 500) {
+      const endpoint = new URL(url);
+      return { ...discovered, baseUrl: endpoint.origin, host: endpoint.hostname };
+    }
+  } catch { /* Keep the announced local endpoint when loopback is not ready. */ }
+  return discovered;
+}
+
 function localAddresses() {
   return Object.values(networkInterfaces()).flat().filter(Boolean).map(entry => entry.address);
 }

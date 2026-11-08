@@ -1,9 +1,11 @@
 const RECOVERED_TASK_STATES=new Set(['failed','cancelled','interrupted']);
-const DSH_CONNECTION_ERROR=/(?:DSH event stream reconnect failed|connect ECONN(?:REFUSED|RESET)|fetch failed|socket hang up|Timed out connecting to the DSH event stream|^Request timed out\.?$|^Connection error\.?$)/i;
+const DSH_CONNECTION_ERROR=/(?:DSH event stream reconnect failed|DSH launch-token exchange failed with HTTP (?:401|403|404)|connect ECONN(?:REFUSED|RESET)|fetch failed|socket hang up|Timed out connecting to the DSH event stream|^Request timed out\.?$|^Connection error\.?$)/i;
 const DSH_TOOL_RUNTIME_ERROR=/(?:Cannot read properties of undefined \(reading ['"]prepare['"]\)|\bprepare undefined\b|TOOL_RUNTIME_SCHEDULER|(?:工具执行|工具调用).{0,100}(?:持续失效|彻底失效|失败|中断|结果未留存|结果未记录)|tool (?:execution|call).{0,100}(?:failed|interrupted|not recorded|not retained))/i;
 
 /** Return error IDs whose underlying incident has verifiable recovery evidence. */
 export function findResolvedErrorIds({taskRows,store,guardianState,modelConnection}) {
+  const errors=store.allErrors();
+  if(!errors.length)return [];
   const tasks=new Map(taskRows.map(task=>[task.id,task]));
   const superseded=new Set(store.db.prepare("SELECT DISTINCT taskId FROM events WHERE taskId IS NOT NULL AND type='task.superseded'").all().map(row=>row.taskId));
   const deliveredFallbacks=new Set(store.db.prepare(`
@@ -21,9 +23,10 @@ export function findResolvedErrorIds({taskRows,store,guardianState,modelConnecti
       )
   `).all().map(row=>row.directorTaskId));
   const attachmentsResolved=!store.db.prepare("SELECT 1 FROM attachment_outbox WHERE status IN ('pending','sending','uncertain') LIMIT 1").get();
-  const uncertainNotificationsResolved=!store.db.prepare("SELECT 1 FROM outbox WHERE status='uncertain' LIMIT 1").get();
   const dshOnline=modelConnection.state('dsh').status==='online';
-  const allTasks=store.allTasks();
+  // The caller supplies the canonical snapshot. Reading it again can disagree
+  // with that snapshot and needlessly decode every historical task result.
+  const allTasks=taskRows;
   const recoveredDshTask=task=>task?.engine==='dsh' && RECOVERED_TASK_STATES.has(task.status);
   const routeEndpoint=task=>{
     const row=store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='dsh.route' ORDER BY id DESC LIMIT 1").get(task?.id);
@@ -59,16 +62,19 @@ export function findResolvedErrorIds({taskRows,store,guardianState,modelConnecti
   };
   const recoveredService=(message,service)=>!guardianState.stale && message.includes(service.error) && guardianState.services?.[service.name]?.status==='healthy';
 
-  return store.allErrors().filter(error=>{
+  return errors.filter(error=>{
     const task=error.taskId?tasks.get(error.taskId):null;
+    const completedAfterError=task?.status==='completed'&&!!store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='completed' AND createdAt>? LIMIT 1").get(task.id,error.createdAt);
     const attachmentFailure=!error.taskId && /^QQ 附件(?:通知暂时失败，已保留并将重试：|被明确拒绝，已保留并将重试：|发送结果不确定，已停止自动重发)/.test(error.message);
     const recoveredAttachmentFailure=attachmentsResolved && attachmentFailure;
-    const recoveredNotificationFailure=!error.taskId && uncertainNotificationsResolved
-      && /^QQ 消息发送结果不确定，已停止自动重发/.test(error.message);
+    // Generic QQ uncertainty errors have no persisted outbox ID. The absence
+    // of uncertain rows is not a receipt: rows may have been pruned or moved,
+    // and a later unrelated send cannot prove this message arrived.
     const recoveredDshConnectionFailure=recoveredDshTask(task) && DSH_CONNECTION_ERROR.test(error.message)
       && dshOnline && sameInstanceDshCompletion(error,task);
-    const recoveredDshRuntimeFailure=recoveredDshTask(task) && sameCapabilityRecovery(error,task)
-      && /(?:DSH RPC session\/prompt|Connection error\.|Cannot read properties of undefined \(reading 'prepare'\)|belongs to .+ not .+)/i.test(error.message);
+    const recoveredDshRuntimeFailure=recoveredDshTask(task)
+      && /(?:DSH RPC session\/prompt|Connection error\.|Cannot read properties of undefined \(reading 'prepare'\)|belongs to .+ not .+)/i.test(error.message)
+      && sameCapabilityRecovery(error,task);
     const recoveredDshToolFailure=recoveredDshTask(task) && DSH_TOOL_RUNTIME_ERROR.test(error.message)
       && sameCapabilityRecovery(error,task);
     const cloneFailure=error.message.startsWith('维护助手启动失败：Command failed: git clone')
@@ -94,7 +100,7 @@ export function findResolvedErrorIds({taskRows,store,guardianState,modelConnecti
       LIMIT 1
     `).get(task.id);
 
-    return recoveredAttachmentFailure || recoveredNotificationFailure || recoveredDshConnectionFailure || recoveredDshRuntimeFailure || recoveredDshToolFailure || recoveredDirectorSessionCwdMismatch(error,task) || recoveredCoordinatorSessionSelection(error,task) || recoveredCloneFailure
+    return completedAfterError || recoveredAttachmentFailure || recoveredDshConnectionFailure || recoveredDshRuntimeFailure || recoveredDshToolFailure || recoveredDirectorSessionCwdMismatch(error,task) || recoveredCoordinatorSessionSelection(error,task) || recoveredCloneFailure
       || staleMaintenanceDiagnostic
       || superseded.has(error.taskId) || deliveredFallbacks.has(error.taskId)
       || recoveredHub || recoveredDsh || recoveredDshFallback || recoveredSnowLuma || recoveredQqLogin || staleWatchdog;

@@ -10,7 +10,7 @@ const DEFAULT_PYTHON = 'python';
 export const VISUAL_IMAGE_EXTENSIONS = new Set(['.bmp', '.jpeg', '.jpg', '.png', '.tif', '.tiff', '.webp']);
 export const DOCUMENT_EXTENSIONS = new Set(['.docx', '.pdf', '.xlsx', '.pptx', ...VISUAL_IMAGE_EXTENSIONS]);
 
-export async function extractDocumentText(file, { pythonCommand } = {}) {
+export async function extractDocumentText(file, { pythonCommand,timeoutMs=120_000 } = {}) {
   const ext = String(file).toLowerCase().slice(String(file).lastIndexOf('.'));
   if (!DOCUMENT_EXTENSIONS.has(ext)) return '';
   let command = pythonCommand || DEFAULT_PYTHON;
@@ -23,7 +23,7 @@ export async function extractDocumentText(file, { pythonCommand } = {}) {
     });
     let output = '';
     let settled = false;
-    const timer = setTimeout(() => { child.kill(); finish(new Error('document text extraction timed out')); }, 120_000);
+    const timer = setTimeout(() => { child.kill(); finish(new Error('document text extraction timed out')); }, timeoutMs);
     const finish = (error, value) => {
       if (settled) return;
       settled = true;

@@ -34,8 +34,16 @@ export function buildTaskPrompt(input = {}) {
   const lines = [];
 
   if (worker) {
-    lines.push('你是固定工作会话，直接完成下面的具体请求；遵循用户明确的范围和交付要求，必要时使用当前引擎可用的能力，完成后简洁说明结果与实际产物路径。');
-    if (context) { const {recentConversation,...facts}=executionContext; if(facts.fileDelivery&&Array.isArray(recentConversation))facts.fileReference=recentConversation.slice(-4); lines.push(`已核实的任务交接上下文（只作事实参考，目标以当前用户任务为准）：\n${bounded(facts)}`); }
+    lines.push('你是固定工作会话，直接完成下面的具体请求；只处理本轮目标及明确交接的相关前次工作，其他历史任务不续做、不附带补报。遵循用户明确的范围和交付要求，必要时使用当前引擎可用的能力，完成后简洁说明结果与实际产物路径。');
+    if (context) {
+      const {recentConversation,taskId,sessionId,...facts}=executionContext;
+      if(facts.previousWork&&typeof facts.previousWork==='object') {
+        const {taskId:previousTaskId,sessionId:previousSessionId,...previousFacts}=facts.previousWork;
+        facts.previousWork=previousFacts;
+      }
+      if(facts.fileDelivery&&Array.isArray(recentConversation))facts.fileReference=recentConversation.slice(-4);
+      lines.push(`已核实的任务交接上下文（只作事实参考，目标以当前用户任务为准）：\n${bounded(facts)}`);
+    }
     if (mailPattern.test(userPrompt)) lines.push('邮件任务：DSH 使用 agently-mail 技能和 agently-cli，先读技能说明；Codex 只使用当前实际可用的邮件连接。遵守确认规则；连接可用不代表邮件已发送。');
     lines.push('用户任务：\n' + userPrompt);
     return { text: lines.join('\n\n'), needsProjectDocs, directorReport, needsTaskState: false, frontdeskOnly, coordinator };
@@ -68,14 +76,14 @@ export function buildTaskPrompt(input = {}) {
   }
 
   if (state) lines.push(`当前任务状态：\n${state}`);
-  if (context) {
+  if (context && !director) {
     if ((director && !directorReport) || coordinator) {
       // The native session already contains earlier chat. Only the referenced
       // work facts cross this boundary; never duplicate six old chat turns.
       const { recentConversation, userRequest, goal, ...facts } = executionContext;
-      if (userRequest && userRequest !== activeTask.prompt) facts.userRequest = userRequest;
-      if (goal && goal !== activeTask.prompt && goal !== userRequest) facts.goal = goal;
-      if (coordinator && !facts.previousWork && !facts.relevantWork && Array.isArray(recentConversation)) facts.recentUserContext=recentConversation.filter(item=>item.role==='user').slice(-2).map(item=>({text:String(item.text||'').slice(0,240)}));
+      const requestAlreadyIncluded = !!userRequest && userPrompt.includes(userRequest);
+      if (userRequest && !requestAlreadyIncluded) facts.userRequest = userRequest;
+      if (goal && !userPrompt.includes(goal) && goal !== userRequest && !requestAlreadyIncluded) facts.goal = goal;
       if (Object.keys(facts).length) lines.push(`相关工作：${bounded(facts)}`);
     } else lines.push(`原始任务交接：\n${context}`);
   }

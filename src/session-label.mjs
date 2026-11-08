@@ -3,6 +3,9 @@ import { redact } from './redact.mjs';
 // Human-facing session name. Native session IDs remain internal routing data;
 // this label is safe to show in the hub and QQ notifications.
 export function sessionDisplayName(task = {}) {
+  if(task.role==='director')return String(task.prompt||'').startsWith('[内部工作回报]')?'中枢 · 结果汇报':'中枢 · 对话主管';
+  if(task.role==='coordinator')return '中枢 · 二级主管（派单）';
+  if(task.role==='reporter')return '中枢 · 结果整理（DSH）';
   const role = task.role === 'director' ? '主管' : task.role === 'coordinator' ? '二级主管' : task.role === 'librarian' ? '资料整理' : task.role === 'maintenance' ? '维护' : '任务';
   const prompt = redact(String(task.prompt ?? ''))
     .replace(/\b(?:session|thread)-[a-z0-9-]{8,}\b/gi, '')

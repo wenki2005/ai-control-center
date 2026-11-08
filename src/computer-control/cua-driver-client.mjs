@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { INTERACTIVE_COMPUTER_TOOLS, READ_ONLY_COMPUTER_TOOLS, validateComputerAction } from './action-contract.mjs';
 
 const PIPE_PREFIX = '\\\\.\\pipe\\';
@@ -40,6 +41,7 @@ export class CuaDriverClient {
     this.executable = executable;
     this.spawn = spawn;
     this.timeoutMs = timeoutMs;
+    this.session = `hub-${randomUUID()}`;
   }
 
   call(tool, args = {}, { signal } = {}) {
@@ -48,9 +50,16 @@ export class CuaDriverClient {
     try {
       encodeArgs(args);
       validateComputerAction(tool, args);
-      const driverArgs = tool === 'type_text'
-        ? { pid: args.pid, element_token: args.element_token, text: args.text, delivery_mode: 'background' }
-        : args;
+      const driverArgs = ['click', 'type_text', 'press_key', 'scroll'].includes(tool)
+        ? Object.fromEntries(Object.entries({
+            pid: args.pid, element_token: args.element_token, text: args.text,
+            key: args.key, direction: args.direction, amount: args.amount, by: args.by,
+            button: args.button, count: args.count, delivery_mode: 'background',
+            session: this.session,
+          }).filter(([, value]) => value !== undefined))
+        : tool === 'get_window_state'
+          ? { pid: args.pid, window_id: args.window_id, tree_format: 'elements', session: this.session, ...(args.include_screenshot === false ? { include_screenshot: false } : {}) }
+          : args;
       input = encodeArgs(driverArgs);
     } catch (error) {
       if (error instanceof TypeError && /JSON object/.test(error.message)) return Promise.reject(error);

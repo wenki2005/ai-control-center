@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 
 const DEFAULT_CODEX = 'codex';
 const SERVER_REQUESTS = new Set([
@@ -13,6 +15,31 @@ const SERVER_REQUESTS = new Set([
   'mcpServer/elicitation/request',
 ]);
 const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+
+function isManagedCodexPath(value) {
+  return /(?:^|[\\/])OpenAI[\\/]Codex[\\/]bin[\\/][^\\/]+[\\/]codex\.exe$/i.test(String(value ?? ''));
+}
+
+/** Resolve Codex's versioned per-user install while preserving explicit custom commands. */
+export function resolveCodexExecutable(options = {}) {
+  const configured = options.codexPath ?? options.binaryPath ?? options.command;
+  if (configured && existsSync(configured)) return configured;
+  if (configured && !isManagedCodexPath(configured)) return configured;
+
+  const binRoot = options.managedBinRoot ?? (process.env.LOCALAPPDATA
+    ? join(process.env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin')
+    : null);
+  if (binRoot && existsSync(binRoot)) {
+    const candidates = readdirSync(binRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(binRoot, entry.name, 'codex.exe'))
+      .filter((path) => existsSync(path))
+      .map((path) => ({ path, mtime: statSync(path).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (candidates.length) return candidates[0].path;
+  }
+  return configured ?? DEFAULT_CODEX;
+}
 
 function sandboxPolicy(mode, cwd) {
   if (mode === 'danger-full-access') return { type: 'dangerFullAccess' };
@@ -109,7 +136,6 @@ function approvalResponse(method, approval, answer) {
 }
 
 export function createCodexAdapter(options = {}) {
-  const executable = options.codexPath ?? options.binaryPath ?? options.command ?? DEFAULT_CODEX;
   const sandboxMode = options.sandboxMode ?? 'workspace-write';
   if (!SANDBOX_MODES.has(sandboxMode)) throw new TypeError(`Unsupported Codex sandbox mode: ${sandboxMode}`);
   const active = new Map();
@@ -123,6 +149,7 @@ export function createCodexAdapter(options = {}) {
   }
 
   function cleanupChild(record) {
+    clearInterval(record.queueWatch);
     detachIdle(record);
     record.busy = false;
     record.lines?.close();
@@ -152,7 +179,8 @@ export function createCodexAdapter(options = {}) {
     if (record.ready) return;
     if (record.connecting) return record.connecting;
     record.connecting = new Promise((resolve, reject) => {
-      const child = (options.spawn ?? spawn)(executable, ['app-server', '--stdio'], {
+      // Desktop updates can remove a versioned binary while the Hub stays up.
+      const child = (options.spawn ?? spawn)(resolveCodexExecutable(options), ['app-server', '--stdio'], {
         cwd: record.task.cwd,
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -192,6 +220,7 @@ export function createCodexAdapter(options = {}) {
 
   const matchesCurrentTurn = (record, params) => {
     if (params.threadId !== record.threadId) return false;
+    if(record.task.nativeQueue&&!record.queueMatched)return false;
     const eventTurnId = params.turnId ?? params.turn?.id;
     return !eventTurnId || (record.turnId && eventTurnId === record.turnId);
   };
@@ -218,14 +247,22 @@ export function createCodexAdapter(options = {}) {
       return;
     }
     const params = message.params ?? {};
-    if(message.method==='thread/tokenUsage/updated' && matchesCurrentTurn(record,params)){const usage=params.tokenUsage?.last;if(usage)record.onEvent({type:'usage',usage:{inputTokens:Number(usage.inputTokens||0),outputTokens:Number(usage.outputTokens||0),totalTokens:Number(usage.totalTokens||0)}});return;}
+    if(record.task.nativeQueue&&params.threadId===record.threadId&&['item/started','item/completed'].includes(message.method)&&params.item?.type==='userMessage'){
+      const text=(params.item.content||[]).filter(x=>x.type==='text').map(x=>x.text).join('\n');
+      if(params.item.clientId===record.task.nativeQueue.clientUserMessageId||text===record.task.prompt){record.queueMatched=true;record.turnId=params.turnId;}
+    }
+    if(message.method==='thread/tokenUsage/updated' && matchesCurrentTurn(record,params)){
+      const usage=params.tokenUsage?.last,turnId=params.turnId||record.turnId;
+      if(usage)record.onEvent({type:'usage',usage:{inputTokens:usage.inputTokens,outputTokens:usage.outputTokens,totalTokens:usage.totalTokens,cacheReadTokens:usage.cachedInputTokens},
+        ...(turnId?{usageId:`turn:${turnId}`} : {}),usageScope:'turn-cumulative'});return;
+    }
     if (message.method === 'turn/started') {
-      if (params.threadId === record.threadId) record.turnId = params.turn?.id;
+      if (params.threadId === record.threadId&&!record.task.nativeQueue) record.turnId = params.turn?.id;
       return;
     }
     if (message.method === 'item/agentMessage/delta' && matchesCurrentTurn(record, params)) {
       record.text += params.delta ?? '';
-      if (params.delta) record.onEvent({ type: 'message', text: record.text });
+      if (params.delta) record.onEvent({ type: 'message', text: record.text,stream:{kind:'snapshot',sessionId:record.threadId,requestId:record.turnId} });
       return;
     }
     if (message.method === 'item/completed' && matchesCurrentTurn(record, params)) {
@@ -236,7 +273,7 @@ export function createCodexAdapter(options = {}) {
       }
       return;
     }
-    const earlyTerminal = message.method === 'turn/completed' && !record.turnId && record.busy
+    const earlyTerminal = message.method === 'turn/completed' && !record.task.nativeQueue && !record.turnId && record.busy
       && params.threadId === record.threadId;
     if (message.method === 'turn/completed' && (matchesCurrentTurn(record, params) || earlyTerminal)
       && (!record.turnId || params.turn?.id === record.turnId)) {
@@ -244,8 +281,8 @@ export function createCodexAdapter(options = {}) {
       record.busy = false;
       record.terminal = true;
       const text = record.text || finalText(params.turn);
-      if (params.turn.status === 'completed') record.onEvent({ type: 'completed', text });
-      else if (!(record.cancelRequested && params.turn.status === 'interrupted')) record.onEvent({ type: 'failed', error: safeError(params.turn.error?.message ?? params.turn.status) });
+      if (params.turn.status === 'completed') record.onEvent({ type: 'completed', text,nativeTurnId:record.turnId });
+      else if (!(record.cancelRequested && params.turn.status === 'interrupted')) record.onEvent({ type: 'failed', error: safeError(params.turn.error?.message ?? params.turn.status),nativeTurnId:record.turnId });
       record.text = '';
       record.cancelRequested = false;
       finishConnectionTurn(record);
@@ -280,7 +317,7 @@ export function createCodexAdapter(options = {}) {
             record.pending.delete(key);
             if (record.terminal && record.pending.size === 0) finishConnectionTurn(record);
             reject(new Error(`Codex app-server request timed out: ${method}`));
-          }, options.rpcTimeoutMs ?? 30000);
+          }, options.rpcTimeoutMs ?? (record.task.nativeQueue&&method==='thread/resume'?120000:30000));
           record.pending.set(key, {
             resolve: (value) => { clearTimeout(timeout); resolve(value); },
             reject: (error) => { clearTimeout(timeout); reject(error); },
@@ -343,13 +380,35 @@ export function createCodexAdapter(options = {}) {
       const record = reuseReporter(task, onEvent) ?? newRecord(task, onEvent);
       try {
         await ensureConnection(record);
+        let queuedRepair;
+        if(task.nativeQueue){
+          if(!task.sessionId)throw Error('修复必须绑定既有原生会话');
+          record.busy=true;record.terminal=false;
+          const pages=[];let cursor=null;
+          do{const page=await record.request('thread/queue/list',{threadId:record.threadId,limit:100,...(cursor?{cursor}:{})});pages.push(...(page.data||[]));cursor=page.nextCursor;if(pages.length>=500&&cursor)throw Error('修复会话队列过长，未重复提交');}while(cursor);
+          const textOf=item=>(item.input||[]).filter(x=>x.type==='text').map(x=>x.text).join('\n');
+          const retired=new Set(task.nativeQueue.retiredRepairIds||[]);
+          for(const item of pages){const marker=/\[中控内部修复 ([a-f0-9]{24})\]/u.exec(textOf(item))?.[1];if(marker&&retired.has(marker)){
+            await record.request('thread/queue/delete',{threadId:record.threadId,queuedSubmissionId:item.id});
+            record.onEvent({type:'progress',kind:'repair-queue-retired',repairId:marker});
+          }}
+          queuedRepair=pages.find(item=>item.clientUserMessageId===task.nativeQueue.clientUserMessageId||textOf(item)===task.prompt)
+            ||(await record.request('thread/queue/add',{threadId:record.threadId,clientUserMessageId:task.nativeQueue.clientUserMessageId,input:[{type:'text',text:task.prompt}]})).queuedSubmission;
+          if(!queuedRepair?.id)throw Error('修复消息未取得原生队列凭据，不能重复提交');
+        }
         if (task.sessionId && !record.reusedIdle) {
-          await record.request('thread/resume', {
+          try{await record.request('thread/resume', {
             threadId: task.sessionId,
             cwd: task.cwd,
             approvalPolicy: 'on-request',
-            sandbox: taskSandboxMode,
-          });
+            ...(!task.preserveNativeSession?{sandbox:taskSandboxMode}:{}),
+          });}catch(error){
+            if(!task.nativeQueue||!/already has an active writer/i.test(String(error.message)))throw error;
+            // queue/add may already have started the native writer. Killing this
+            // connection here interrupts that very repair. Keep the exact queued
+            // message and observe its terminal instead of acquiring it again.
+            record.onEvent({type:'progress',kind:'repair-native-writer-active'});
+          }
           record.threadId = task.sessionId;
         } else if (!task.sessionId) {
           const thread = await record.request('thread/start', {
@@ -362,18 +421,35 @@ export function createCodexAdapter(options = {}) {
         }
         record.reusedIdle = false;
         record.onEvent({ type: 'session', sessionId: record.threadId });
+        if(task.nativeQueue&&record.terminal)return {sessionId:record.threadId,turnId:record.turnId};
         record.busy = true;
         record.terminal = false;
         record.cancelRequested = false;
-        const result = await record.request('turn/start', {
+        let result;
+        if(task.nativeQueue){
+          if(!record.queueMatched)try{result=await record.request('thread/queue/start',{threadId:record.threadId,queuedSubmissionId:queuedRepair.id});if(result?.turn?.id){record.turnId=result.turn.id;record.queueMatched=true;}}
+          catch(error){if(!/already has an active or pending turn|already has an active writer|resume the thread before starting a queued message|queued submission not found/i.test(String(error.message)))throw error;/* Keep the exact queue item and connection while the native owner consumes it. */}
+        }else result = await record.request('turn/start', {
           threadId: record.threadId,
           cwd: task.cwd,
-          input: [{ type: 'text', text: typeof task.userText==='string'?task.userText:task.prompt },...(typeof task.userText==='string'&&task.sessionContext?[{type:'text',text:'中枢上下文（独立于用户原话）：\n'+task.sessionContext}]:[])],
+          // Supervisor chat input must remain the user's exact message. The
+          // app-server treats every text item as conversational input too;
+          // appending retrieved context here exposes it as a second user turn.
+          input: [{ type: 'text', text: typeof task.userText==='string'?task.userText:task.prompt }],
           ...(task.model ? { model: task.model } : {}),
           approvalPolicy: 'on-request',
-          sandboxPolicy: sandboxPolicy(taskSandboxMode, task.cwd),
+          ...(!task.preserveNativeSession?{sandboxPolicy:sandboxPolicy(taskSandboxMode,task.cwd)}:{}),
         });
-        record.turnId = result.turn?.id ?? record.turnId;
+        record.turnId = result?.turn?.id ?? record.turnId;
+        if(task.nativeQueue&&!record.terminal){
+          let inspecting=false;
+          const inspect=async()=>{if(inspecting||record.terminal||record.failed||closed)return;inspecting=true;try{
+            const page=await record.request('thread/turns/list',{threadId:record.threadId,limit:10,sortDirection:'desc',itemsView:'summary'});
+            const turn=(page.data||[]).find(t=>(t.items||[]).some(item=>item.type==='userMessage'&&(item.clientId===task.nativeQueue.clientUserMessageId||(item.content||[]).filter(x=>x.type==='text').map(x=>x.text).join('\n')===task.prompt)));
+            if(turn){record.queueMatched=true;record.turnId=turn.id;if(turn.completedAt!==null&&['completed','failed','interrupted'].includes(turn.status))await handleMessage(record,{method:'turn/completed',params:{threadId:record.threadId,turn}});}
+          }catch{/* A read failure is not evidence that the repair failed. */}finally{inspecting=false;}};
+          record.queueWatch=setInterval(()=>void inspect(),5000);record.queueWatch.unref?.();await inspect();
+        }
         return { sessionId: record.threadId, turnId: record.turnId };
       } catch (error) {
         await fail(record, error);
@@ -417,15 +493,18 @@ export function createCodexAdapter(options = {}) {
     },
     async cancel(task) {
       const record = active.get(task.id);
-      if (!record) return;
+      if (!record) {if(task.sessionId)throw Error('未找到此Codex任务的实时控制连接，不能确认已停止');return;}
       for (const [id, approval] of record.approvals) {
         try { record.write({ id: approval.id, result: approvalResponse(approval.method, approval, 'deny') }); } catch { }
         record.approvals.delete(id);
       }
-      if (record.threadId && record.turnId && record.busy) {
+      if (record.threadId && record.turnId && !record.terminal) {
         record.cancelRequested = true;
         record.busy = false;
         await record.request('turn/interrupt', { threadId: record.threadId, turnId: record.turnId });
+        const deadline=Date.now()+5000;
+        while(!record.terminal&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,50));
+        if(!record.terminal)throw Error('Codex已接受中断请求，但尚未确认回合结束');
       }
     },
     async close() {

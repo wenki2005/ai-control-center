@@ -27,8 +27,12 @@ export function redact(value) {
       .replace(/(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|token|password|passwd)\s*[:=]\s*)["']?[^\s,"'&}]+/ig,'$1[REDACTED]');
   }
   if(Array.isArray(value))return value.map(redact);
-  if(value && typeof value==='object')return Object.fromEntries(Object.entries(value).map(([key,item])=>[key,/^(?:inputTokens|outputTokens|cacheReadTokens|cacheWriteTokens|toolsTokens|totalTokens)$/.test(key)&&Number.isFinite(item)&&item>=0?item:/token|password|secret|api.?key|authorization/i.test(key)?'[REDACTED]':redact(item)]));
+  if(value && typeof value==='object')return Object.fromEntries(Object.entries(value).map(([key,item])=>[key,key==='isSecret'&&typeof item==='boolean'?item:/^(?:inputTokens|outputTokens|cacheReadTokens|cacheWriteTokens|toolsTokens|totalTokens)$/.test(key)&&Number.isFinite(item)&&item>=0?item:/token|password|secret|api.?key|authorization/i.test(key)?'[REDACTED]':redact(item)]));
   return value;
+}
+export function containsKnownCredential(value) {
+  const text=String(value);
+  return [...secrets].some(secret=>secret.length>=6 && text.includes(secret));
 }
 export function containsCredential(value) {
   const text=String(value);

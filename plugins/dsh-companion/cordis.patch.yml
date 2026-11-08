@@ -1,0 +1,3 @@
+- insert:
+    - id: ai-center-companion
+      name: '@ai-center/dsh-companion'

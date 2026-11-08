@@ -147,7 +147,7 @@ export function createWorkBuddyAdapter(options = {}) {
         windowsHide: true,
         shell: false,
         stdio: ['pipe', 'pipe', 'pipe'],
-        ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
+        ...((options.env||task.workbuddyConfigDir)?{env:{...process.env,...options.env,...(task.workbuddyConfigDir?{CODEBUDDY_CONFIG_DIR:task.workbuddyConfigDir}:{})}}:{}),
       });
     } catch (error) {
       active.delete(task.id);

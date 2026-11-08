@@ -143,6 +143,9 @@ export class Archive {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.selectAll = this.db.prepare('SELECT * FROM artifacts ORDER BY created_at DESC, id');
+    const summaryColumns='id,task_id,name,path,source_path,hash,size,category,created_at,excerpt';
+    this.selectAllSummary=this.db.prepare('SELECT '+summaryColumns+' FROM artifacts ORDER BY created_at DESC,id');
+    this.selectTaskSummary=this.db.prepare('SELECT '+summaryColumns+' FROM artifacts WHERE task_id=? ORDER BY created_at DESC,id');
     this.selectTask = this.db.prepare('SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at DESC, name COLLATE NOCASE');
     this.selectId = this.db.prepare('SELECT * FROM artifacts WHERE id = ?');
     this.selectSource = this.db.prepare('SELECT * FROM artifacts WHERE task_id = ? AND source_path = ? AND hash = ?');
@@ -257,10 +260,15 @@ export class Archive {
     return this.#record(this.selectSource.get(String(taskId), sourcePath, hash),{includeText:true});
   }
 
-  async collect({ taskId, cwd }) {
+  async collect({ taskId, cwd, maxElapsedMs } = {}) {
     await this._ready;
     if (taskId === undefined || taskId === null || String(taskId).trim() === '') throw new TypeError('taskId is required');
     const workspace = await this.#allowedCwd(cwd);
+    // A caller may give a wider budget for a bounded recovery scan. Keep the
+    // normal limit unchanged so ordinary archive runs remain predictable.
+    const elapsedLimit = Number.isFinite(Number(maxElapsedMs))
+      ? Math.max(0, Number(maxElapsedMs))
+      : this.limits.maxElapsedMs;
     const createdAt = new Date().toISOString();
     const found = [];
     const warnings = [];
@@ -287,8 +295,8 @@ export class Archive {
       entries.sort((a, b) => Number(a.isDirectory()) - Number(b.isDirectory()));
       for (const entry of entries) {
         const relative = relativeDirectory ? path.join(relativeDirectory, entry.name) : entry.name;
-        if (Date.now() - startedAt >= this.limits.maxElapsedMs) {
-          warn(relative, `collection time limit reached (${this.limits.maxElapsedMs} ms)`);
+        if (Date.now() - startedAt >= elapsedLimit) {
+          warn(relative, `collection time limit reached (${elapsedLimit} ms)`);
           stopped = true;
           break;
         }
@@ -339,8 +347,8 @@ export class Archive {
           warn(relative, `task byte limit reached (${MAX_TOTAL_BYTES} bytes)`);
           continue;
         }
-        if (Date.now() - startedAt >= this.limits.maxElapsedMs) {
-          warn(relative, `collection time limit reached (${this.limits.maxElapsedMs} ms)`);
+        if (Date.now() - startedAt >= elapsedLimit) {
+          warn(relative, `collection time limit reached (${elapsedLimit} ms)`);
           stopped = true;
           break;
         }
@@ -422,11 +430,12 @@ export class Archive {
     return this.selectSearch.all(term, term, term).map((row) => this.#record(row));
   }
 
+  async recent(limit=10) {await this._ready;const rows=this.db.prepare('SELECT id,task_id,name,path,source_path,hash,size,category,created_at,excerpt FROM artifacts ORDER BY created_at DESC,id LIMIT ?').all(Math.max(1,Math.min(100,Math.floor(limit))));return {records:rows.map(row=>this.#record(row)),total:this.db.prepare('SELECT count(*) n FROM artifacts').get().n};}
   async list({ taskId, includeText = false, maxTextLength = 12000 } = {}) {
     await this._ready;
     const rows = taskId === undefined || taskId === null
-      ? this.selectAll.all()
-      : this.selectTask.all(String(taskId));
+      ? (includeText?this.selectAll:this.selectAllSummary).all()
+      : (includeText?this.selectTask:this.selectTaskSummary).all(String(taskId));
     return rows.map((row) => this.#record(row,{includeText,maxTextLength}));
   }
 

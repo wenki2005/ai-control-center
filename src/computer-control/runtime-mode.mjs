@@ -4,17 +4,17 @@ export const READ_ONLY_CUA_SOCKET = String.raw`\\.\pipe\Mornye-Readonly-CUA`;
 export const INTERACTIVE_CUA_SOCKET = String.raw`\\.\pipe\Mornye-Interactive-CUA`;
 // This is Cua Driver's normalized digest for the reviewed, repository-pinned
 // manifest. A daemon on the default pipe or with a broader policy never passes.
-export const READ_ONLY_CUA_EFFECTIVE_MANIFEST_SHA256 = 'a7cab93fdccbb8bf5e5d3a65b1b69cc2b380b1140e9831b3a3f75e60d5b04dd0';
-export const INTERACTIVE_CUA_EFFECTIVE_MANIFEST_SHA256 = '7ab2234a6adfba5194da7f5d1180134ca9e6653519282a9eadff528d070fd581';
+export const READ_ONLY_CUA_EFFECTIVE_MANIFEST_SHA256 = 'ec8bd4499c81dcca214be8a076d86186290f518754215b3a5bcb8915fb26f9b2';
+export const INTERACTIVE_CUA_EFFECTIVE_MANIFEST_SHA256 = '7b1c40d63412abad119ccb030385edc9038a4b4b12207723e835fd1c6a589829';
 
-export function computerControlLaunchOptions({argv=[],env={}}={}) {
+export function computerControlLaunchOptions({argv=[],env={},approvedMode=null}={}) {
   const args=Array.isArray(argv)?argv:[];
   const inline=args.find(value=>typeof value==='string'&&value.startsWith('--cua-executable='));
   const separateIndex=args.indexOf('--cua-executable');
   const explicitExecutable=inline?.slice('--cua-executable='.length)
     || (separateIndex>=0 && typeof args[separateIndex+1]==='string' ? args[separateIndex+1] : '');
   return {
-    interactiveOptIn:args.includes('--interactive-computer-control')||env.MORNYE_CUA_INTERACTIVE==='1',
+    interactiveOptIn:args.includes('--interactive-computer-control')||env.MORNYE_CUA_INTERACTIVE==='1'||approvedMode==='interactive',
     executable:explicitExecutable||env.MORNYE_CUA_EXECUTABLE||'cua-driver',
   };
 }

@@ -1,7 +1,7 @@
 /**
  * Natural-language authorization policy for director dispatch.
- * DSH is the default engine. Codex and WorkBuddy require an explicit assignment
- * in the director prompt. This intentionally mirrors the existing Hub rules.
+ * Current user assignment wins, followed by the per-request execution setting.
+ * Only automatic routing may choose by continuity and capabilities.
  */
 export function allowsEngine(prompt, engine) {
   const text = String(prompt?.prompt ?? prompt ?? '');
@@ -15,6 +15,8 @@ export function allowsEngine(prompt, engine) {
   const negativeBefore = /(?:不要|别|不必|不应该|不可以|不能|不想|不愿(?:意)?|不希望|不需要|不用|不使用|不交给|不派给|不派发给|不发给|不跟|不和|不是|无需)(?:再\s*)?(?:(?:把[^，。；！？!\?\n\r]{0,14}?)?(?:用|使用|通过|让|交给|派给|派发给|分配给|发给|给|委托给|指派给|交由|由|选|选择)|(?:跟|和))?\s*(?:(?:我|你|他|那个|这边|本轮)\s*)?$/iu;
   const negativeAfter = /^\s*(?:不要|别|不必|不应该|不可以|不能|不想|不愿意|不需要|不用|不使用|不是)(?:\s|$)/iu;
   for (const clause of text.split(/[，,。；;！？!?\n\r]+/)) {
+    // An explanation of an earlier routing decision is not a new assignment.
+    if(/为什么|怎么(?:会|又|还)|为何/u.test(clause)&&!/(?:现在|这次|本轮|改为|改用|重新|请|帮我).*(?:用|交给|派给|选择)/u.test(clause))continue;
     mention.lastIndex = 0;
     for (const match of clause.matchAll(mention)) {
       const before = clause.slice(Math.max(0, match.index - 48), match.index);
@@ -28,6 +30,8 @@ export function allowsEngine(prompt, engine) {
 
 /** Preserve the Hub's precedence: codex, then workbuddy, then dsh. */
 export function requestedEngine(prompt) {
+  const command=parseExplicitEngineCommand(String(prompt?.prompt??prompt??''));
+  if(command)return command.engine;
   for (const engine of ['codex', 'workbuddy', 'dsh']) if (allowsEngine(prompt, engine)) return engine;
   return null;
 }
@@ -48,9 +52,14 @@ export function parseExplicitEngineCommand(text) {
  * non-DSH engine; the second-level coordinator may choose any available engine
  * when the user asked for work but did not pin a particular engine.
  */
-export function resolveDispatchEngine({ parentPrompt, proposedEngine, taskPrompt, availableEngines, autoRoute = false } = {}) {
+export function resolveDispatchEngine({ parentPrompt, proposedEngine, taskPrompt, availableEngines, autoRoute = false, selectedEngine, continuationEngine } = {}) {
   const requested = requestedEngine(parentPrompt);
   if (requested) return requested;
+  if(selectedEngine&&selectedEngine!=='auto') {
+    if(!['dsh','codex','workbuddy'].includes(selectedEngine)||Array.isArray(availableEngines)&&!availableEngines.includes(selectedEngine))throw Error('所选任务引擎当前不可用，请修改任务执行设置；不会自动改派其他引擎。');
+    return selectedEngine;
+  }
+  if(continuationEngine&&(!Array.isArray(availableEngines)||availableEngines.includes(continuationEngine)))return continuationEngine;
   if (autoRoute) {
     const available=Array.isArray(availableEngines)?availableEngines:['dsh','codex','workbuddy'];
     const work=`${String(parentPrompt?.prompt??parentPrompt??'')}\n${String(taskPrompt??'')}`;

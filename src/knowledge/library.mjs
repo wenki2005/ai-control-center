@@ -1,3 +1,4 @@
+import {withTerminalRelease} from '../adapters/terminal-release.mjs';
 import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -314,7 +315,7 @@ export class Library {
       timer.unref?.();
       this.store.update(task.id,{status:'running'});
       const cleanupImages=()=>imageCleanupDirectory?rm(imageCleanupDirectory,{recursive:true,force:true}):Promise.resolve();
-      const start = Promise.resolve().then(() => this.adapter.start({ ...task,agentPreset:'mornye-report',role:'librarian',sessionId:undefined,imagePaths,onImagesLoaded:cleanupImages },onEvent));
+      const start = Promise.resolve().then(() => this.adapter.start({ ...task,agentPreset:'mornye-report',role:'librarian',sessionId:undefined,imagePaths,onImagesLoaded:cleanupImages },withTerminalRelease(this.adapter,task,onEvent)));
       start.then(()=>{if(timedOut)void cancelOwn();}).catch((error)=>{if(!terminal){terminal=true;settle(error);}});
       this.children.set(row.id,{task,settle:()=>{terminal=true;settle(new Error('classification cancelled during shutdown'));}});
     });

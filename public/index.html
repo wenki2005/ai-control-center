@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#eef4fc">
-  <title>助手 · AI 中控</title>
+  <title>AI 中枢</title>
+  <link id="app-favicon" rel="icon" type="image/png" href="/default-avatar.png">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -12,7 +13,7 @@
     <header class="topbar">
       <div class="identity">
         <div class="avatar avatar-large" id="active-persona-avatar" aria-hidden="true"><img src="/default-avatar.png" alt=""></div>
-        <div><h1 id="active-persona-name">助手</h1><div class="subtitle">AI 中控 <span class="sep">·</span> 本机工作台</div></div>
+        <div><h1>AI 中枢</h1><div class="subtitle"><span id="active-persona-name">当前助手</span> <span class="sep">·</span> 本机工作台</div></div>
       </div>
       <div class="health-strip" id="health-strip" aria-label="服务状态"></div>
       <button class="menu-button" id="menu-toggle" aria-label="打开控制面板" aria-expanded="false">☰</button>
@@ -21,15 +22,17 @@
     <main class="workspace">
       <section class="conversation panel" aria-label="和当前人设对话">
         <div class="conversation-heading">
-          <div><div class="eyebrow">PRIVATE CHANNEL</div><h2 id="conversation-persona-title">和助手说</h2></div>
+          <div><div class="eyebrow">PRIVATE CHANNEL</div><h2 id="conversation-persona-title">对话</h2></div>
           <div class="conversation-heading-right"><div class="companion-mood" id="companion-mood" aria-live="polite"></div><div class="connection" id="connection-label"><span class="status-dot"></span><span>连接中…</span></div><button class="direct-session-button" id="direct-session-open" type="button">选择 DSH 会话</button></div>
         </div>
         <div class="state-error inline-error" id="state-error" role="alert" hidden></div>
         <div class="chat-log" id="chat-log" aria-live="polite" aria-label="聊天记录"></div>
+        <section id="voice-player" class="voice-player" aria-label="语音播放器" hidden><div id="voice-player-title"></div><audio id="voice-player-audio" controls preload="none"></audio><button id="voice-player-close" type="button" aria-label="停止并收起播放器">收起</button><span id="voice-player-status" role="status"></span></section>
+        <div class="screen-presence"><button class="direct-session-button" id="screen-companion-open" type="button">陪我工作 · 看屏幕</button><span id="screen-companion-badge" role="status">未共享屏幕</span><button class="direct-session-button" id="screen-companion-send" type="button" hidden>发送共享画面</button><a class="direct-session-button" href="/remote-devices.html" title="批准设备连接、选择远端陪伴电脑">陪伴助手 · 连接设备</a><button class="direct-session-button" id="drawing-open" type="button">画一张图</button><button class="direct-session-button" id="voice-settings-open" type="button">语音与音色</button></div>
         <div class="chat-error inline-error" id="chat-error" role="alert" hidden></div>
         <form class="chat-composer" id="chat-form">
           <label class="sr-only" for="chat-input">发消息给当前人设</label>
-          <textarea id="chat-input" rows="1" placeholder="你，想聊什么？" maxlength="12000"></textarea>
+          <textarea id="chat-input" rows="1" placeholder="想聊些什么？" maxlength="12000"></textarea>
           <button class="send-button" id="chat-send" type="submit" aria-label="发送消息">↑</button>
           <div class="composer-hint">Enter 发送 <span>·</span> Shift + Enter 换行</div>
         </form>
@@ -40,7 +43,7 @@
           <button class="side-tab active" type="button" role="tab" id="tab-work" data-page="work" aria-controls="page-work" aria-selected="true">派发</button>
           <button class="side-tab" type="button" role="tab" id="tab-approvals" data-page="approvals" aria-controls="page-approvals" aria-selected="false">待选 <span class="tab-badge" id="approval-tab-count" hidden>0</span></button>
           <button class="side-tab" type="button" role="tab" id="tab-tasks" data-page="tasks" aria-controls="page-tasks" aria-selected="false">任务</button>
-          <button class="side-tab" type="button" role="tab" id="tab-archive" data-page="archive" aria-controls="page-archive" aria-selected="false">文件库</button>
+          <button class="side-tab" type="button" role="tab" id="tab-archive" data-page="archive" aria-controls="page-archive" aria-selected="false">文件管理</button>
           <button class="side-tab" type="button" role="tab" id="tab-system" data-page="system" aria-controls="page-system" aria-selected="false">系统</button>
           <button class="side-tab" type="button" role="tab" id="tab-companion" data-page="companion" aria-controls="page-companion" aria-selected="false">人设卡</button>
         </nav>
@@ -76,16 +79,25 @@
         <section class="panel tasks-panel">
           <div class="section-heading"><div><div class="eyebrow">WORK QUEUE</div><h2>任务记录</h2></div><span class="small-note" id="task-count">0 项</span></div>
           <div class="task-list" id="task-list"><div class="empty-state">还没有任务。</div></div>
+          <button type="button" id="task-history-more" hidden>读取更早一页任务</button><span id="task-history-status" role="status"></span>
         </section>
 
         <section class="panel errors-panel" id="errors-panel" hidden>
           <div class="section-heading"><div><div class="eyebrow">ATTENTION</div><h2>最近错误</h2></div><span class="count-badge error-count" id="error-count">0</span></div>
-          <div class="error-list" id="error-list"></div>
+          <a href="/delivery.html" target="_blank" rel="noopener">核查消息送达</a><div class="error-list" id="error-list"></div>
         </section>
           </div>
 
           <div class="side-page" id="page-archive" role="tabpanel" aria-labelledby="tab-archive" data-page-content="archive" hidden>
-        <section class="panel library-panel">
+        <div class="file-sections" role="tablist" aria-label="文件来源"><button type="button" role="tab" id="sent-files-tab" aria-controls="sent-files-panel" aria-selected="true">她发来的</button><button type="button" role="tab" id="task-files-tab" aria-controls="task-files-panel" aria-selected="false">任务成果</button><button type="button" role="tab" id="personal-files-tab" aria-controls="library-workspace" aria-selected="false">个人文件</button></div>
+        <section class="panel sent-files-panel" id="sent-files-panel" role="tabpanel" aria-labelledby="sent-files-tab">
+          <div class="section-heading"><div><h2>她发来的文件</h2><p class="file-manager-note">文档和图片按最近发送排列，随时回来查看。</p></div><button class="library-small-button" id="sent-files-refresh" type="button">刷新</button></div>
+          <form class="search-form" id="sent-files-search"><label class="sr-only" for="sent-files-query">搜索收到的文件</label><input type="search" id="sent-files-query" placeholder="搜索文件名或任务…" maxlength="200"><button type="submit">搜索</button></form>
+          <div class="sent-files-filters"><label class="sr-only" for="sent-files-type">文件类型</label><select id="sent-files-type"><option value="all">文档和图片</option><option value="document">文档</option><option value="image">图片</option><option value="sticker">表情图片</option></select><span id="sent-files-count" class="small-note" aria-live="polite"></span></div>
+          <div id="sent-files-status" class="file-manager-note" role="status"></div><div id="sent-files-list" class="sent-files-list"></div>
+          <div class="sent-files-pagination"><button type="button" id="sent-files-prev">上一页</button><span id="sent-files-page"></span><button type="button" id="sent-files-next">下一页</button></div>
+        </section>
+        <section class="panel library-panel" id="library-workspace" role="tabpanel" aria-labelledby="personal-files-tab" hidden>
           <div class="section-heading"><div><div class="eyebrow">PERSONAL LIBRARY</div><h2>个人文件库 <span class="small-note" id="library-count">0 项</span></h2></div></div>
           <form class="library-import" id="library-import-form">
             <label class="field-label" for="library-directory">导入本机目录</label>
@@ -108,34 +120,105 @@
             <div class="library-job-list" id="library-job-list"><div class="empty-state">还没有分类任务。</div></div>
           </details>
           <div class="library-list" id="library-list"><div class="empty-state">导入一个目录后，文件会显示在这里。</div></div>
-          <details class="legacy-archive">
-            <summary>任务文件归档 <span class="small-note" id="archive-count">0 项</span></summary>
+        </section>
+        <details class="panel" id="file-operations-section">
+          <summary>整理指定工作目录</summary>
+          <p class="file-manager-note">先预览，再执行。支持指定范围内已有子目录之间的文件移动、重命名、重复识别与撤销；不创建目录，重复文件只列出。请选择运行工作区内的独立子目录，并在操作期间保留目录位置。</p>
+          <label>操作目录（绝对路径）<input id="fo-root" type="text" maxlength="1000" autocomplete="off" placeholder="工作区内的独立子目录"></label>
+          <label>操作<select id="fo-mode"><option value="rename">重命名</option><option value="move">移动</option><option value="dedupe">识别内容重复</option></select></label>
+          <label>源文件（相对于操作目录；识别重复时每行一个）<textarea id="fo-source" rows="3" maxlength="8000"></textarea></label>
+          <label>目标文件名或路径<input id="fo-destination" type="text" maxlength="1000"></label>
+          <div class="file-sections"><button id="fo-preview" type="button">预览</button><button id="fo-commit" type="button" disabled>执行预览</button><button id="fo-cancel" type="button" disabled>取消未执行预览</button><button id="fo-undo" type="button" disabled>撤销</button><button id="fo-reconcile" type="button" disabled>核对中断状态</button></div>
+          <p id="fo-status" role="status"></p><p id="fo-plan-id" class="small-note"></p><ul id="fo-plan"></ul>
+        </details>
+        <section class="panel" id="task-files-panel" role="tabpanel" aria-labelledby="task-files-tab" hidden>
+            <div class="section-heading"><h2>任务成果 <span class="small-note" id="archive-count">0 项</span></h2></div>
+            <p class="file-manager-note">最近生成的文件；尚未确认发送的成果也可在这里找，搜索可查看历史归档。</p>
             <form class="search-form" id="search-form"><label class="sr-only" for="search-input">搜索任务归档</label><input id="search-input" type="search" placeholder="搜索任务文件…" maxlength="200"><button type="submit" aria-label="搜索任务归档">⌕</button></form>
             <div class="knowledge-list" id="knowledge-list"><div class="empty-state">归档后文件会显示在这里。</div></div>
-          </details>
         </section>
           </div>
 
           <div class="side-page" id="page-system" role="tabpanel" aria-labelledby="tab-system" data-page-content="system" hidden>
+        <section class="panel" id="local-resource-section">
+          <div class="section-heading"><h2>本机资源与健康</h2><button id="local-resources-refresh" type="button">刷新</button></div>
+          <p id="local-resources-status" role="status">等待本机采样…</p><div id="local-resources-values"></div><div id="local-resources-work"></div><p id="local-resources-alerts"></p>
+          <p id="local-maintenance-status" role="status"></p><button id="local-resources-reconcile" type="button">核对历史绘图预约</button>
+        </section>
         <section class="panel system-panel">
           <div class="section-heading"><div><div class="eyebrow">LOCAL SUPERVISOR</div><h2>守护状态</h2></div><span class="small-note" id="system-primary">读取中…</span></div>
           <div class="system-summary" id="system-summary">正在读取本机中控状态…</div>
-          <details class="system-window"><summary>一级主管会话设置</summary>
+          <details class="system-window" id="server-monitor-window"><summary>全机服务器监督 · 1Panel</summary>
+            <p id="server-monitor-status" role="status">打开后读取巡检状态。</p>
+            <div id="server-monitor-metrics"></div><div id="server-monitor-incidents"></div>
+            <form id="server-monitor-form">
+              <label><input id="server-monitor-enabled" type="checkbox"> 启用服务器巡检与 QQ 异常预警</label>
+              <label><input id="server-monitor-resource-focus" type="checkbox"> 只关注容量、流量和服务器到期（暂停安全、CPU、容器和站点告警）</label>
+              <label><input id="server-monitor-recovery" type="checkbox"> 异常恢复后也通知（关闭时正常和恢复均保持安静）</label>
+              <label><input id="server-monitor-summary" type="checkbox"> 定期概览（默认关闭，开启后默认每日一次，不调用模型）</label>
+              <label><input id="server-monitor-ai" type="checkbox"> 异常通知使用 AI 润色（默认关闭，开启后每天最多调用2次）</label>
+              <div class="screen-companion-controls">
+                <label>间隔（秒）<input id="server-monitor-interval" type="number" min="30" max="3600" value="60" required></label>
+                <label>连续异常次数<input id="server-monitor-count" type="number" min="1" max="10" value="3" required></label>
+                <label>CPU 阈值 %<input id="server-monitor-cpu" type="number" min="30" max="100" value="85" required></label>
+                <label>内存阈值 %<input id="server-monitor-memory" type="number" min="30" max="100" value="85" required></label>
+                <label>磁盘阈值 %<input id="server-monitor-disk" type="number" min="30" max="100" value="85" required></label>
+                <label>安全/容器/站点巡检间隔（秒）<input id="server-monitor-inventory-interval" type="number" min="60" max="3600" value="600" required></label>
+                <label>概览汇报间隔（小时）<input id="server-monitor-summary-hours" type="number" min="1" max="24" value="24" required></label>
+                <label>出口速率提醒线（Mbps）<input id="server-monitor-traffic-mbps" type="number" min="1" max="100000" value="100" required></label>
+                <label>每日已记录出口提醒（GB，0不设）<input id="server-monitor-daily-gb" type="number" min="0" max="1000000" value="0" required></label>
+                <label>每月已记录出口提醒（GB，0不设）<input id="server-monitor-monthly-gb" type="number" min="0" max="10000000" value="0" required></label>
+                <label>服务器到期日（按云厂商账单填写）<input id="server-monitor-expires" type="date"></label>
+                <label>提前多少天提醒<input id="server-monitor-expiry-days" type="number" min="1" max="90" value="30" required></label>
+              </div>
+              <button class="system-check" type="submit">保存巡检设置</button><button class="system-check" id="server-monitor-check" type="button">现在检查</button>
+            </form><p class="small-note">资源模式只检查整台服务器的磁盘、内存、流量与登记到期日，不再请求安全、容器和站点清单。正常时不推送，持续异常默认6小时最多提醒一次；指标连续15分钟取不到才提醒监控失联。流量是监控期间已记录的出口增量，不是云厂商账单。到期日须按实际续费信息填写，默认提前30天、7天、1天及当天各提醒一次。日常规则检查和通知不调用模型。</p>
+            <p id="server-monitor-feedback" role="status"></p>
+          </details>
+            <details class="system-window"><summary>主管与任务引擎设置</summary>
           <form class="director-engine-settings" id="director-engine-form">
             <div class="director-engine-heading"><strong>一级主管会话</strong><small>选择主管会话接入位置</small></div>
             <label class="director-engine-field" for="director-engine-select"><span>接入位置</span><select id="director-engine-select" name="engine"><option value="dsh">DSH 3080 · QQ 助手项目</option><option value="codex">Codex · 本机 Codex（助手项目）</option></select></label>
-            <p>切换后从下一条对话生效；中枢会用本地记忆和接续记录衔接，旧会话保留。二级协调与执行任务的路由不受影响。</p>
+              <p>这里只选择跟你聊天的一级主管。实际干活使用下面的“任务执行引擎”；切换后会衔接本地记忆，旧会话保留。</p>
             <button class="system-check" id="director-engine-save" type="submit">保存主管引擎</button>
             <div class="form-feedback" id="director-engine-feedback" role="status" aria-live="polite"></div>
           </form>
+            <form class="director-engine-settings" id="worker-engine-form">
+              <div class="director-engine-heading"><strong>任务执行引擎</strong><small>决定派给哪个引擎的工作会话</small></div>
+              <label class="director-engine-field" for="worker-engine-select"><span>执行位置</span><select id="worker-engine-select"><option value="dsh">固定使用 DSH 3080</option><option value="codex">固定使用 Codex</option><option value="auto">自动选择 · 按能力与前次上下文</option></select></label>
+              <p>从下一条消息开始生效，已派出的任务保留。固定选择优先于关键词路由和旧任务引擎；你在当条消息明确指定其他引擎时，以当条要求为准。自动模式下，同一任务优先续接原会话。</p>
+              <button class="system-check" id="worker-engine-save" type="submit">保存任务引擎</button>
+              <div class="form-feedback" id="worker-engine-feedback" role="status" aria-live="polite"></div>
+            </form>
           </details>
           <button class="system-check" id="system-check" type="button">检查并恢复</button>
           <div class="form-feedback" id="system-feedback" role="status"></div>
         </section>
+          <details class="system-window" id="agent-completion-window"><summary>全机 Agent 完成通知</summary>
+            <label class="news-option-row"><span><strong>由当前人设转达其他会话的完成消息</strong><small>接收独立会话的新回执，中枢任务不重复通知；关闭不影响已经进入汇报队列的消息</small></span><input id="agent-completion-enabled" type="checkbox"></label>
+            <p id="agent-completion-status" role="status">展开后读取接入状态。</p>
+            <div id="agent-completion-sources"></div>
+            <div id="agent-completion-recent"></div>
+          </details>
+          <details class="system-window" id="worker-pool-window"><summary>工作会话池 <small>三个 DSH 席位，空闲优先</small></summary>
+          <section class="panel"><p>独立任务可分给三个 DSH 工作会话并行执行。首次使用才建立会话，之后持续复用；同一任务的补充和重试保留原会话。</p><div id="worker-pool-list"></div><button id="worker-pool-refresh" type="button">刷新席位状态</button><p id="worker-pool-status" role="status"></p></section>
+        </details>
+        <details class="system-window" id="daily-token-window"><summary>每日 Token <small>当天消耗、会话排行、七日趋势</small></summary>
+          <section class="panel">
+            <form id="daily-token-form"><label>统计日期 <input id="daily-token-date" type="date" required></label><button type="submit">查看</button> <button id="daily-token-refresh" type="button">刷新</button></form>
+            <p id="daily-token-status" role="status"></p><div id="daily-token-totals"></div>
+            <h3>引擎与角色</h3><div id="daily-token-groups"></div>
+            <h3>会话消耗</h3><div id="daily-token-sessions"></div>
+            <h3>最近七天</h3><div id="daily-token-history"></div>
+            <form id="daily-token-budget-form"><label>每日用量提醒线（0 表示关闭）<input id="daily-token-budget" type="number" min="0" max="1000000000" step="1" value="0"></label><button type="submit">保存提醒线</button></form>
+            <p id="daily-token-reference"></p><p id="daily-token-scope" class="small-note"></p>
+            <a id="daily-token-export" href="/api/usage/daily/export" download>导出 Markdown</a>
+          </section>
+        </details>
         <details class="system-window"><summary>电脑状态检查 <small>读取窗口需你批准</small></summary>
         <section class="panel computer-panel" aria-labelledby="computer-heading">
-          <div class="section-heading"><div><div class="eyebrow">DESKTOP · READ ONLY</div><h2 id="computer-heading">电脑状态检查</h2></div><span class="small-note" id="computer-availability">只读申请</span></div>
-          <p class="computer-note">只枚举当前可见窗口，或读取你指定窗口的状态。每次检查都会先显示摘要，由你批准后交给本机视觉会话分析；截图不会显示在这里。</p>
+          <div class="section-heading"><div><div class="eyebrow">DESKTOP · VERIFIED ACTIONS</div><h2 id="computer-heading">电脑检查与操作</h2></div><span class="small-note" id="computer-availability">只读申请</span></div>
+          <p class="computer-note">先读取并核对目标窗口，再选择刚观察到的控件。每次操作显示摘要并等待批准，执行后核对实际结果；截图和文档正文不在此显示。</p>
           <div class="computer-actions">
             <button class="system-check" id="computer-list-windows" type="button">申请查看可见窗口</button>
           </div>
@@ -143,6 +226,14 @@
             <label><span>PID</span><input id="computer-pid" inputmode="numeric" pattern="[0-9]+" maxlength="10" placeholder="例如 1234" required></label>
             <label><span>窗口 ID</span><input id="computer-window-id" inputmode="numeric" pattern="[0-9]+" maxlength="20" placeholder="例如 5678" required></label>
             <button class="system-check" type="submit">申请读取窗口</button>
+          </form>
+          <div class="computer-actions"><button type="button" class="system-check" id="computer-yield">我来操作，暂停桌面动作</button><button type="button" class="system-check" id="computer-resume">桌面已空闲，允许继续</button><span id="computer-lease-state" role="status"></span></div>
+          <form id="computer-control-form" class="computer-window-form">
+            <label>目标控件<select id="computer-control-target" required><option value="">先批准读取窗口取得控件</option></select></label>
+            <label>动作<select id="computer-control-tool"><option value="click">点击</option><option value="type_text">输入文字</option><option value="press_key">按键</option><option value="scroll">向下滚动</option></select></label>
+            <label>文字或按键<input id="computer-control-text" maxlength="160" placeholder="输入正文，或 ENTER / CTRL+S"></label>
+            <label>预期结果文字<input id="computer-control-expected" maxlength="160" placeholder="可选，执行后核对"></label>
+            <button type="submit" class="system-check">申请控件操作</button>
           </form>
           <div class="computer-feedback" id="computer-feedback" role="status" aria-live="polite"></div>
           <div class="computer-action-list" id="computer-action-list"><div class="empty-state">读取检查状态中…</div></div>
@@ -170,8 +261,19 @@
                     <div><div class="companion-subheading" id="proactive-heading">主动联系</div><small>也控制晨报和重要新闻等主动分享</small></div>
                     <label class="proactive-toggle"><span class="sr-only">允许当前人设主动联系</span><input id="proactive-enabled" type="checkbox"><span aria-hidden="true"></span></label>
                   </div>
-                  <p>关闭后会暂停所有主动分享。日常闲聊只在 09:00–21:00、至少间隔 3 小时；晨报和重要新闻按下面的单独设置运行。</p>
+                  <p>关闭后暂停主动分享。日常闲聊在 09:00–23:00，连续 15 分钟无互动后才考虑；主管忙碌或有未送达消息时暂缓。晨报和重要新闻按下面的单独设置运行。</p>
                   <div class="proactive-status" id="proactive-status" role="status">读取设置中…</div>
+                  <label class="news-option-row"><span><strong>自主使用手机</strong><small>空闲时自己选内容、浏览应用，发现有趣的事再分享；沿用主动联系时段</small></span><span class="proactive-toggle"><input id="phone-autonomy-enabled" type="checkbox" aria-label="允许自主使用手机"><span aria-hidden="true"></span></span></label>
+                  <details class="companion-window" id="phone-social-window"><summary>刷手机与评论草稿</summary>
+                    <p id="phone-social-status" role="status">展开后检查手机连接。</p>
+                    <form id="phone-social-form">
+                      <label class="companion-field"><span>想逛哪里</span><select id="phone-social-platform"><option value="bilibili">B站</option><option value="heybox">小黑盒</option></select></label>
+                      <label class="companion-field"><span>想看什么（可留空，让她自己挑）</span><input id="phone-social-goal" maxlength="500" placeholder="找点有趣的内容，看看大家怎么聊"></label>
+                      <button class="system-check" type="submit">让她去逛逛</button>
+                    </form>
+                    <p>浏览会进入现有手机工作队列。评论先展示完整原文和目标，你确认后才发布；结果不确定时不会自动重发。</p>
+                    <div id="phone-social-drafts"></div>
+                  </details>
                 </section>
                 <form id="news-form" class="proactive-settings news-settings">
                   <div class="proactive-setting-top">
@@ -185,9 +287,26 @@
                 </form>
                 </details>
                 <details class="companion-window diary-window">
-                  <summary>自动日记 <small>每天 22:30 整理当天对话，仅保存在本机</small></summary>
+                  <summary>日记与每日总结 <small>22:30 私人日记 · 23:00 总结并推送 QQ</small></summary>
                   <section class="proactive-settings">
                     <div class="proactive-setting-top"><div><div class="companion-subheading">私人日记</div><small id="diary-status">读取日记状态中…</small></div><label class="proactive-toggle"><span class="sr-only">启用自动日记</span><input id="diary-enabled" type="checkbox"><span aria-hidden="true"></span></label></div>
+                    <div class="proactive-setting-top"><div><div class="companion-subheading">每日总结与 QQ 推送</div><small id="daily-review-status">每天 23:00（上海），中枢自动总结当天交流并推送</small></div><label class="proactive-toggle"><span class="sr-only">启用每日总结与QQ推送</span><input id="daily-review-enabled" type="checkbox"><span aria-hidden="true"></span></label></div>
+                    <p id="daily-review-preview" class="diary-content"></p>
+                    <details id="cognition-panel">
+                      <summary>记忆评分、反思与计划</summary>
+                      <p id="cognition-status">读取中…</p>
+                      <label><input id="cognition-enabled" type="checkbox"> 启用自主反思与计划</label>
+                      <div class="proactive-settings">
+                        <label>近期程度权重 <input id="cognition-recency" type="number" min="0" max="10" step="0.5" value="1"></label>
+                        <label>相关性权重 <input id="cognition-relevance" type="number" min="0" max="10" step="0.5" value="3"></label>
+                        <label>重要性权重 <input id="cognition-importance" type="number" min="0" max="10" step="0.5" value="2"></label>
+                        <label>反思积累阈值 <input id="cognition-threshold" type="number" min="20" max="1000" value="150"></label>
+                        <button id="cognition-save" type="button">保存记忆设置</button>
+                      </div>
+                      <small>反思是带来源的推断，与确认事实分开；新消息与事实更正会触发计划调整。</small>
+                      <div id="cognition-reflections"></div>
+                      <div id="cognition-plans"></div>
+                    </details>
                     <div class="diary-list" id="diary-list"><div class="empty-state">还没有日记</div></div>
                   </section>
                 </details>
@@ -207,9 +326,19 @@
                     <label class="companion-field"><span>头像</span><select id="persona-avatar" aria-label="人设头像"><option value="default-avatar.png">默认头像</option></select></label>
                     <label class="companion-field"><span>中枢主题色</span><input id="persona-theme-color" type="color" aria-label="中枢主题色" value="#5d79b2"></label>
                   </div>
+                  <div class="persona-grid">
+                    <label class="companion-field"><span>QQ 昵称</span><input id="persona-qq-nickname" maxlength="80" placeholder="留空：使用角色名"></label>
+                    <label class="companion-field"><span>关联音色</span><select id="persona-voice-profile" aria-label="人设关联音色"><option value="">默认音色（不联动）</option></select></label>
+                  </div>
+                  <div class="persona-grid">
+                    <label class="library-check" for="persona-qq-sync"><input id="persona-qq-sync" type="checkbox"><span>同步 QQ 昵称和头像</span></label>
+                    <small id="persona-identity-status" role="status" aria-live="polite">正在读取 QQ 同步状态…</small>
+                  </div>
                   <label class="companion-field"><span>交流风格</span><textarea id="persona-style" name="style" rows="3" maxlength="600" placeholder="温和、清楚，像熟悉的搭档一样交流…"></textarea></label>
                   <label class="companion-field"><span>背景与相处约定</span><textarea id="persona-background" name="background" rows="4" maxlength="1200" placeholder="补充这个角色的背景、偏好与相处方式…"></textarea></label>
-                  <label class="companion-field"><span>示例表达</span><textarea id="persona-examples" name="examples" rows="3" maxlength="3006" placeholder="写下你喜欢的表达方式或对话例子…"></textarea></label>
+                  <label class="companion-field"><span>对话示例（最多六组，组间空一行）</span><textarea id="persona-examples" name="examples" rows="6" maxlength="3012" placeholder="组内可换行写用户与角色的对话；每组之间空一行…"></textarea></label>
+                  <label class="companion-field"><span>转述与汇报风格</span><textarea id="persona-report-style" rows="3" maxlength="600" placeholder="完成、等待、受阻时，怎样说话更像这个角色…"></textarea></label>
+                  <label class="companion-field"><span>汇报示例（最多六组，组间空一行）</span><textarea id="persona-report-examples" rows="4" maxlength="3012" placeholder="只学语气，不照抄示例中的任务或结果…"></textarea></label>
                   <div class="companion-form-footer"><span class="form-feedback" id="persona-feedback" role="status"></span><button class="primary-button companion-save" type="submit">保存人设</button></div>
                   </details>
                 </form>
@@ -224,6 +353,31 @@
                     <div class="companion-form-footer"><span class="form-feedback" id="behavior-feedback" role="status"></span><div><button type="button" class="system-check" id="behavior-reset">恢复默认</button> <button class="primary-button companion-save" type="submit">保存中枢行为</button></div></div>
                   </form>
                 </details>
+                <details class="companion-window" id="sticker-window"><summary>聊天表情 <small>搜表情、预览、发到 QQ</small></summary>
+                  <section class="memory-section">
+                    <label><input type="checkbox" id="stickers-enabled"> 允许主管搜索并发送表情</label>
+                    <label><input type="checkbox" id="stickers-auto-collect"> 每6小时收集新表情，审核后使用</label>
+                    <p>可以直接对她说“找个害羞的猫猫表情发我”。每条消息最多配一张，图片会保留在本机表情库。</p>
+                    <form id="sticker-search-form"><input id="sticker-query" maxlength="60" placeholder="如：开心、害羞猫猫、晚安" required aria-label="表情关键词"><button type="submit">上网找表情</button></form>
+                    <div id="sticker-status" role="status"></div><div id="sticker-list" class="sticker-list"></div>
+                  </section>
+                </details>
+                <details class="companion-window" id="timeline-window"><summary>记忆时间线 <small>随手记、按时间找回</small></summary>
+                  <section class="memory-section">
+                    <p>笔记会自动整理，并保留来源与日期依据。不确定的日期单独列出。</p>
+                    <form id="timeline-note-form" class="memory-create-form">
+                      <input id="timeline-title" maxlength="180" placeholder="标题（可选）" aria-label="笔记标题">
+                      <textarea id="timeline-note" rows="3" maxlength="20000" placeholder="记下一件事，或粘贴零散笔记…" required aria-label="笔记内容"></textarea>
+                      <label>事情发生日期（可留空）<input id="timeline-date" type="date"></label>
+                      <button type="submit">保存并整理</button>
+                    </form>
+                    <form id="timeline-search-form"><input id="timeline-search" placeholder="搜索经历或关键词" aria-label="搜索时间线"><button type="submit">搜索</button></form>
+                    <button id="timeline-refresh" type="button">重新整理</button>
+                    <a href="/api/companion/timeline/export" download="记忆时间线.md">导出 Markdown</a>
+                    <div id="timeline-status" role="status"></div>
+                    <div id="timeline-list" class="memory-list"></div>
+                  </section>
+                </details>
                 <details class="companion-window"><summary>共用记忆 <small>编辑、归档、恢复</small></summary>
                 <section class="memory-section" aria-labelledby="memory-heading">
                   <div class="companion-subheading"><span id="memory-heading">记忆条目</span><small>可编辑、归档或恢复</small></div>
@@ -235,6 +389,14 @@
                   <div class="memory-list" id="memory-list"><div class="empty-state">打开记忆页后读取本机记忆…</div></div>
                 </section>
                 </details>
+                <details class="companion-window" id="memory-audit-window"><summary>历史记忆检查 <small>补漏、核对矛盾</small></summary>
+                  <section class="memory-section">
+                    <p class="small-note">仅从真实用户交流中整理候选，不自动覆盖已确认资料。普通候选在“共用记忆”的待确认条目中查看。</p>
+                    <button type="button" id="memory-audit-scan">检查下一批历史</button>
+                    <p id="memory-audit-status" class="small-note" role="status"></p>
+                    <div id="memory-audit-list" class="memory-list"></div>
+                  </section>
+                </details>
               </div>
             </section>
           </div>
@@ -242,6 +404,34 @@
       </aside>
     </main>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <dialog class="direct-session-dialog" id="drawing-dialog" aria-labelledby="drawing-title">
+      <form method="dialog" class="direct-session-top"><h2 id="drawing-title">画一张图</h2><button class="direct-session-close" aria-label="关闭">×</button></form>
+      <form id="drawing-form">
+        <label class="field-label" for="drawing-engine">生图方式</label>
+        <select id="drawing-engine"><option value="local">本机生图</option><option value="codex">Codex · 生图</option></select>
+        <label class="field-label" for="drawing-name">画作名称</label><input id="drawing-name" maxlength="45" placeholder="例如：雨后的花园" required>
+        <label class="field-label" for="drawing-prompt">想画什么</label><textarea id="drawing-prompt" rows="4" maxlength="3000" placeholder="描述画面、风格和构图" required></textarea>
+        <label><input id="drawing-share" type="checkbox" checked> 完成后通过 QQ 发给我</label>
+        <button type="submit" class="primary-button" id="drawing-submit" disabled>开始画图</button>
+      </form>
+      <p id="drawing-feedback" role="status"></p><div id="drawing-list"></div>
+    </dialog>
+    <dialog class="direct-session-dialog" id="voice-settings-dialog" aria-labelledby="voice-settings-title">
+      <form method="dialog" class="direct-session-top"><div><div class="eyebrow">VOICE SETTINGS</div><h2 id="voice-settings-title">语音与音色</h2></div><button class="direct-session-close" aria-label="关闭">×</button></form>
+      <p class="direct-session-note">语音模式会分段朗读全部文字回复，包括长内容和任务汇报；原文保留在中枢。</p>
+      <label class="field-label" for="voice-profile">当前音色</label>
+      <select id="voice-profile"></select>
+      <button class="primary-button" id="voice-profile-save" type="button">切换音色</button>
+      <label class="library-check" for="voice-enabled"><input id="voice-enabled" type="checkbox"><span>所有文字回复都读出来</span></label>
+      <p id="voice-settings-feedback" role="status" aria-live="polite"></p>
+      <button class="direct-session-button" id="voice-history-open" type="button">播放已生成的语音</button>
+    </dialog>
+    <dialog class="direct-session-dialog" id="voice-history-dialog" aria-labelledby="voice-history-title">
+      <form method="dialog" class="direct-session-top"><h2 id="voice-history-title">语音回放</h2><button class="direct-session-close" aria-label="关闭">×</button></form>
+      <p class="direct-session-note">复用已生成的音频，无需重新合成或发送 QQ。多段语音会按顺序播放。</p>
+      <button class="direct-session-button" id="voice-history-refresh" type="button">刷新记录</button>
+      <p id="voice-history-feedback" role="status"></p><div id="voice-history-list"></div>
+    </dialog>
     <dialog class="direct-session-dialog" id="direct-session-dialog" aria-labelledby="direct-session-title">
       <form method="dialog" class="direct-session-top"><div><div class="eyebrow">DSH QQ 会话</div><h2 id="direct-session-title">直连一个会话</h2></div><button class="direct-session-close" aria-label="关闭">×</button></form>
       <p class="direct-session-note">选择后，中控对话框会把你的原话直接发到该会话。连接本身不会发送消息。</p>
@@ -251,12 +441,25 @@
     </dialog>
     <dialog class="direct-session-dialog" id="session-cleanup-dialog" aria-labelledby="session-cleanup-title">
       <form method="dialog" class="direct-session-top"><div><div class="eyebrow">DSH 会话整理</div><h2 id="session-cleanup-title">整理旧自动会话与测试会话</h2></div><button class="direct-session-close" aria-label="关闭">×</button></form>
+      <label><input type="checkbox" id="session-retention-enabled" checked disabled> 自动归档旧系统会话</label>
+      <p id="session-retention-status">每小时检查：系统创建超过3天，或闲置超过15天的会话。归档前备份对话并整理记忆候选；个人、固定、正在工作和归属不明的会话保留。</p>
       <p class="direct-session-note">仅整理旧中枢自动派发或确证测试会话。你自建的对话、当前固定会话、未结束任务和待确认操作会自动保护。收纳会从常用工作区隐藏会话，历史仍可恢复；不会永久删除记录。</p>
       <div id="session-cleanup-list" class="direct-session-list"><div class="empty-state">正在读取…</div></div>
       <div class="direct-session-bottom"><span id="session-cleanup-feedback" role="status"></span><button id="session-cleanup-confirm" class="direct-session-exit" type="button" disabled>收纳所选会话</button></div>
     </dialog>
+    <dialog class="direct-session-dialog screen-companion-dialog" id="screen-companion-dialog" aria-labelledby="screen-companion-heading">
+      <form method="dialog" class="direct-session-top"><h2 id="screen-companion-heading">选择共享画面</h2><button class="direct-session-close" aria-label="取消选择">×</button></form>
+      <div id="screen-companion-feedback" role="status" hidden></div>
+    </dialog>
     <div class="mobile-backdrop" id="mobile-backdrop"></div>
   </div>
+  <dialog id="sent-file-preview" class="sent-file-preview" aria-labelledby="sent-file-preview-title"><div class="sent-file-preview-heading"><h2 id="sent-file-preview-title">文件预览</h2><button type="button" id="sent-file-preview-close" aria-label="关闭文件预览">×</button></div><div id="sent-file-preview-body"></div><a id="sent-file-preview-download" class="download-link" download>下载文件</a></dialog>
   <script src="/app.js" defer></script>
+  <script src="/file-manager.js" defer></script>
+  <script src="/file-operations.js" defer></script>
+  <script src="/local-resources.js" defer></script>
+  <script src="/voice-playback.js" defer></script>
+  <script src="/screen-companion.js" defer></script>
+  <script src="/server-monitor.js" defer></script>
 </body>
 </html>

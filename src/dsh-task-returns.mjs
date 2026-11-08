@@ -5,8 +5,9 @@ import { cp, lstat, mkdir, readdir, realpath, writeFile } from 'node:fs/promises
 import { join, relative, resolve, sep } from 'node:path';
 
 const sessionIdVariants=id=>id.startsWith('session-')?[id,id.slice(8)]:[id,`session-${id}`];
+const nativeSessionId=id=>/^session-[\w-]+$/u.test(id)||/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/iu.test(id);
 
-async function directoryManifest(root) {
+export async function directoryManifest(root) {
   const entries=[];
   async function walk(directory) {
     const children=await readdir(directory,{withFileTypes:true});
@@ -75,33 +76,41 @@ export class DshTaskReturns {
   }
   async rpc(method,args,{timeoutMs=5000}={}) {
     const rpcId=randomUUID();
-    const response=await this.request(`${this.baseUrl}/api/${method}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId,method,payload:{args}}),signal:this.timeoutFactory(timeoutMs)});
+    let response;
+    try{response=await this.request(`${this.baseUrl}/api/${method}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId,method,payload:{args}}),signal:this.timeoutFactory(timeoutMs)});}
+    catch(error){error.dshMethod=method;throw error;}
     if(!response.ok)throw Error(`DSH ${method} HTTP ${response.status}`);
     const value=await response.json();
     if(value.rpcId!==rpcId || !value.result?.ok)throw Error(`DSH ${method} 未返回有效结果`);
     return value.result.value;
   }
-  async listSessions() {
+  async listSessions({includeDelegated=false}={}) {
     // DSH's session projection can take longer than task RPCs when it must
     // load a large, cold history. Give this read-only enumeration its own
     // bounded window so the UI does not report a false session failure at 5s.
     const value=await this.rpc('session/list',{_request:{}},{timeoutMs:this.sessionListTimeoutMs});
     const rows=Array.isArray(value?.items)?value.items:[];
     return rows.map(row=>{
-      const title=String(row?.projections?.values?.title ?? row?.title ?? row?.name ?? '').trim();
+      const title=String(row?.projections?.values?.title ?? row?.title ?? row?.name ?? (includeDelegated&&row?.parentSessionId?row?.projections?.values?.subagent?.label||'自动子会话':'')).trim();
       const sessionId=String(row?.sessionId ?? '');
       const cwd=String(row?.cwd ?? row?.projections?.values?.cwd ?? '');
-      if(!/^session-[\w-]+$/u.test(sessionId) || !title || !cwd) return null;
+      if(!(includeDelegated?nativeSessionId(sessionId):/^session-[\w-]+$/u.test(sessionId)) || !title || !cwd) return null;
       const updatedAt=row?.updatedAt ?? row?.projections?.values?.updatedAt ?? null;
       const turns=Number(row?.turnCount ?? row?.turns ?? row?.projections?.values?.turnCount ?? 0);
-      return {sessionId,title,cwd,running:row?.running===true,runningKnown:typeof row?.running==='boolean',updatedAt:updatedAt!=null&&Number.isFinite(Number(updatedAt))?Number(updatedAt):null,turns:Number.isFinite(turns)?turns:0};
+      const createdAt=row?.createdAt??row?.projections?.values?.createdAt;
+      return {sessionId,title,cwd,...(row.parentSessionId&&nativeSessionId(row.parentSessionId)?{parentSessionId:row.parentSessionId}:{}),...(row.origin==='subagent'?{origin:'subagent'}:{}),running:row?.running===true,runningKnown:typeof row?.running==='boolean',...(createdAt!=null&&Number.isFinite(Number(createdAt))?{createdAt:Number(createdAt)}:{}),updatedAt:updatedAt!=null&&Number.isFinite(Number(updatedAt))?Number(updatedAt):null,turns:Number.isFinite(turns)?turns:0};
     }).filter(Boolean);
   }
-  async archiveSession(sessionId) {
-    if(!/^session-[\w-]+$/u.test(String(sessionId||'')))throw Error('DSH 会话身份无效');
-    const listed=(await this.listSessions()).find(item=>item.sessionId===sessionId);
+  async archiveSession(sessionId,{beforeArchive,guard,sessionSnapshot}={}) {
+    if(!nativeSessionId(String(sessionId||'')))throw Error('DSH 会话身份无效');
+    // A retention scan already enumerated the catalog. Reuse that initial
+    // snapshot, then always obtain a fresh catalog after backup preparation.
+    if(sessionSnapshot&&sessionSnapshot.sessionId!==sessionId)throw Error('归档快照身份不匹配');
+    const initialSessions=sessionSnapshot?[sessionSnapshot]:await this.listSessions({includeDelegated:true});
+    const listed=initialSessions.find(item=>item.sessionId===sessionId);
     if(!listed)throw Error('会话不存在或已不可用');
     if(listed.running!==false||listed.runningKnown!==true)throw Error('无法确认会话已停止；为保护正在运行的会话，已取消归档');
+    await guard?.(listed,initialSessions);
 
     const root=await realpath(this.sessionDataRoot),directories=[];
     for(const slug of await readdir(root,{withFileTypes:true})) {
@@ -143,10 +152,16 @@ export class DshTaskReturns {
       await writeFile(join(base,'manifest.json'),manifestText,{flag:'wx'});
       this.store.db.prepare('INSERT INTO dsh_session_backups(id,sessionId,backupPath,manifestHash,status,createdAt) VALUES(?,?,?,?,?,?)')
         .run(randomUUID(),sessionId,base,manifestHash,'verified',this.store.now());
+      await (beforeArchive||this.prepareArchive)?.({sessionId,title:listed.title,backupPath:base,manifestHash});
       // Recheck running state immediately before archiving the active projection.
-      const latest=(await this.listSessions()).find(item=>item.sessionId===sessionId);
+      const latestSessions=await this.listSessions({includeDelegated:true});
+      const latest=latestSessions.find(item=>item.sessionId===sessionId);
       if(!latest||latest.running!==false||latest.runningKnown!==true)throw Error('会话运行状态已变化或无法确认；备份已保留，没有归档会话');
-      await this.rpc('workspace/archiveSession',{request:{sessionId,stopActivity:false}},{timeoutMs:15000});
+      if(latest.updatedAt!==listed.updatedAt)throw Error('会话在备份后被再次使用；备份已保留，没有归档会话');
+      await guard?.(latest,latestSessions);
+      for(let i=0;i<directories.length;i++)if(JSON.stringify(before[i].files)!==JSON.stringify(await directoryManifest(directories[i].source)))throw Error('原会话内容在归档准备期间变化，已保留备份并停止归档');
+      const archived=await this.rpc('workspace/archiveSession',{request:{sessionId,stopActivity:false}},{timeoutMs:15000});
+      if(!Array.isArray(archived?.archivedSessionIds)||!archived.archivedSessionIds.includes(sessionId))throw Object.assign(Error('DSH 未确认目标会话已归档；保留备份等待核对'),{archiveResultUnknown:true});
       const now=this.store.now();
       this.store.transaction(()=>{
         this.store.db.prepare('INSERT INTO dsh_archived_sessions(sessionId,archivedAt) VALUES(?,?) ON CONFLICT(sessionId) DO UPDATE SET archivedAt=excluded.archivedAt').run(sessionId,now);
@@ -167,8 +182,16 @@ export class DshTaskReturns {
     }
     if(!this.enabled || this.stopping)return Promise.resolve(true);
     if(this.pending)return this.pending;
-    this.pending=this.sync().then(()=>true).catch(error=>{
+    const started=Date.now();
+    this.pending=this.sync().then(()=>{
+      this.failed=false;this.consecutiveFailures=0;
+      const recovered=this.store.db.prepare("SELECT id FROM errors WHERE message LIKE 'DSH 原生任务回报连接暂时不可用，将自动重试：%'").all();
+      if(recovered.length)this.store.clearErrors(recovered.map(row=>row.id),{reason:'native-sync-completed'});
+      this.store.meta?.('dsh-native:sync-health',JSON.stringify({status:'online',checkedAt:new Date().toISOString(),elapsedMs:Date.now()-started}));
+      return true;
+    }).catch(error=>{
       this.consecutiveFailures++;
+      this.store.meta?.('dsh-native:sync-health',JSON.stringify({status:'retrying',phase:this.syncPhase,checkedAt:new Date().toISOString(),elapsedMs:Date.now()-started,consecutiveFailures:this.consecutiveFailures,errorType:error.name||'Error'}));
       // A single missed poll is expected during DSH restarts or local network
       // jitter. Keep retrying silently, but surface explicit auth/protocol
       // failures immediately and sustained transport failures after 3 polls.
@@ -180,12 +203,15 @@ export class DshTaskReturns {
     return this.pending;
   }
   async sync() {
-    const response=await this.request(`${this.baseUrl}/mornye/api/tasks/compact`,{signal:AbortSignal.timeout(5000)});
+    this.syncPhase='compact';
+    let response;
+    for(let attempt=0;attempt<2;attempt++) {
+      try {response=await this.request(`${this.baseUrl}/mornye/api/tasks/compact`,{signal:AbortSignal.timeout(5000)});break;}
+      catch(error){if(attempt||!isTransientPollError(error))throw error;}
+    }
     if(!response.ok)throw Error(`DSH 任务列表 HTTP ${response.status}`);
     const value=await response.json();if(!Array.isArray(value.tasks))throw Error('DSH 任务列表格式无效');
-    this.failed=false;this.consecutiveFailures=0;
-    const recovered=this.store.db.prepare("SELECT id FROM errors WHERE message LIKE 'DSH 原生任务回报连接暂时不可用，将自动重试：%'").all();
-    if(recovered.length)this.store.clearErrors(recovered.map(row=>row.id));
+    this.syncPhase='task-processing';
     // First attach: replay results completed after the most recent supervisor
     // reply, rather than flooding QQ with the old stack's entire history.
     let since=this.store.meta('dsh-native:return-since');

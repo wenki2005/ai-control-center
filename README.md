@@ -8,6 +8,7 @@
 - SQLite 和记忆检索、可编辑人设卡、情绪状态、主动联系、新闻和日记的通用程序能力。
 - QQ OneBot 接入与成果回传、资料导入归档的通用代码。
 - 空白配置、默认中性头像、启动入口、语法检查与备份/回滚辅助脚本。
+- 通用 DSH 独立上下文插件（plugins/dsh-companion），支持用户原话传递、共用记忆检索、情绪口吻和 DS Bot 工具隔离；不含任何个人角色卡。
 
 ## 不包含
 
@@ -28,6 +29,7 @@ DSH、Codex、QQ OneBot 服务需要自行安装并授权。本包不包含模�
 - Codex：自行安装并登录 Codex CLI，将 `codexCommand` 配置为完整可执行路径。默认命令为 `codex`，执行依赖 PATH；健康面板的可执行文件检查建议用绝对路径。不同版本需要独立验收。
 - QQ：复制 `qq-config.example.json` 到新 `runtime/qq-config.json`，填入本人 owner 和 OneBot 凭据，再把新 `runtime/config.json` 中 `qqIngressEnabled` 改为 true，重启本包。首次接入使用命令前缀模式；不要和另一套接管相同账号的中枢同时启用。没有配置时 QQ 默认关闭。
 - 邮箱：在所选引擎中另行安装邮件技能并完成授权，本包不携带既有邮箱账户。
+- DSH 主管上下文：使用主管会话时，需要在本人的 DSH 插件管理中安装并启用解压目录里的 `plugins/dsh-companion`，按 DSH 提示重新加载插件。保留整个分发目录结构，插件通过相对目录读取本包 runtime 下的会话上下文和记忆数据库。它不含 DSH 或 DS Bot 本体，也不会预置账号。
 - 文档/图片解析：按需要安装 Python 和 `pypdf python-docx openpyxl python-pptx Pillow PyMuPDF`；基本纯文本归档无需这些额外包。
 - 可选联网 CLI：自行安装 `bili`、`mcporter`、`opencli`，分别可用 `HUB_BILI_COMMAND`、`HUB_MCPORTER_CLI`、`HUB_OPENCLI_COMMAND` 覆盖路径；相关账户与 MCP 配置由使用者提供。
 
@@ -37,6 +39,14 @@ DSH、Codex、QQ OneBot 服务需要自行安装并授权。本包不包含模�
 
 这个包是从当前工作区生成的独立清洁副本，通用化修改仅在副本进行，不会重载原服务。旧版自启/守护、桌面 Electron 包、原机 DSH 维护和自动修复部署流程不随包分发；专职维护默认关闭，primaryMode 请保持 false。`src/director-plugin` 保留工具逻辑和研究读取模块，但不含绑定旧人设的插件安装清单，不是可直接安装的 DSH 插件包。
 
-分发包不附带原工作区的个人验收记录和测试集，`npm run check` 只检查语法。打包方另外完成了独立空数据启动检查；接收方仍需对自己的 DSH/Codex/QQ 账户做真实链路验收。依赖 ws 通过 npm 安装，适用其自身许可；DSH、Codex 和其他外部组件未打包。项目自身的再发布许可由项目所有者决定。
+分发包不附带原工作区的个人验收记录，只附带去个人化的基础测试；运行 npm test。`npm run check` 只检查语法。打包方另外完成了独立空数据启动检查；接收方仍需对自己的 DSH/Codex/QQ 账户做真实链路验收。依赖 ws 通过 npm 安装，适用其自身许可；DSH、Codex 和其他外部组件未打包。项目自身的再发布许可由项目所有者决定。
 
 后续转发时，勿将自己运行后生成的 runtime、.env、node_modules、日志或备份加入压缩包。
+
+## 本版结构说明
+
+参阅 docs/architecture.md 和 docs/distribution.md。本版已加入分段发送账本、按需状态读取、独立续接生命周期模块、Qwen可选语义检索、有限自动修复和低成本运行采样。Ollama和嵌入模型需要自行安装下载，不在源码包内。自动修复需要操作者配置自己的修复会话和验收规则；本包基础测试不能代替本人业务回归。
+
+## 当前项目说明
+
+完整能力、架构、依赖与边界见 [项目说明](docs/项目说明.md)。本版包含主管对已注册 agent-desktop 状态工具的查询例外，真正操作仍由执行会话承担。使用者需另行安装并授权 agent-desktop；本包不携带二进制和个人 MCP 配置。

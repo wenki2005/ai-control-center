@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { SAFE_COMPUTER_TOOLS } from './tool-policy.mjs';
 import { INTERACTIVE_COMPUTER_TOOLS, READ_ONLY_COMPUTER_TOOLS, validateComputerAction } from './action-contract.mjs';
+import { validateComputerConditions } from './action-contract.mjs';
+import { verifyWindowEvidence } from './computer-postconditions.mjs';
+import { redact } from '../redact.mjs';
 
 export { SAFE_COMPUTER_TOOLS } from './tool-policy.mjs';
 
@@ -24,7 +27,7 @@ function snapshotArgs(args) {
 /** Approval broker for one-shot desktop actions. Arguments/results remain memory-only. */
 export class ComputerControlBroker {
   // Each deployment must opt into a subset of the read-only pilot tools.
-  constructor({ store, lease, client, allowedTools = [], interactiveAllowed = false, clock = () => Date.now(), leaseTtlMs = 60_000, approvalTtlMs = 10 * 60_000 } = {}) {
+  constructor({ store, lease, client, allowedTools = [], interactiveAllowed = false, clock = () => Date.now(), leaseTtlMs = 60_000, approvalTtlMs = 10 * 60_000, fileValidator } = {}) {
     if (!store?.db || typeof store.transaction !== 'function') throw new TypeError('ComputerControlBroker requires a Store');
     if (!lease || typeof lease.acquire !== 'function' || typeof lease.release !== 'function') throw new TypeError('ComputerControlBroker requires a DesktopLease');
     if (!client || typeof client.call !== 'function') throw new TypeError('ComputerControlBroker requires a CUA client');
@@ -32,18 +35,20 @@ export class ComputerControlBroker {
     if (!Array.isArray(allowedTools) || !allowedTools.length || allowedTools.some((v) => !permitted.includes(v))) {
       throw new TypeError('allowedTools must be a non-empty subset of the explicitly enabled broker tool allowlist');
     }
-    if (interactiveAllowed && (!allowedTools.includes('type_text') || !allowedTools.includes('get_window_state'))) throw new TypeError('Interactive mode requires type_text and get_window_state for post-action verification');
+    if (interactiveAllowed && (!allowedTools.some((tool) => INTERACTIVE_COMPUTER_TOOLS.includes(tool)) || !allowedTools.includes('get_window_state'))) throw new TypeError('Interactive mode requires an interactive action and get_window_state for post-action verification');
     this.store = store;
     this.lease = lease;
     this.client = client;
     this.allowedTools = new Set(allowedTools);
     this.interactiveAllowed = interactiveAllowed;
+    this.fileValidator = fileValidator;
     this.clock = clock;
     this.leaseTtlMs = leaseTtlMs;
     if (!Number.isSafeInteger(approvalTtlMs) || approvalTtlMs < 1_000 || approvalTtlMs > 24 * 60 * 60_000) throw new TypeError('approvalTtlMs must be between 1 second and 24 hours');
     this.approvalTtlMs = approvalTtlMs;
     this.waiters = new Map();
     this.liveArgs = new Map();
+    this.observations = new Map();
     store.db.exec(`CREATE TABLE IF NOT EXISTS computer_actions (
       id TEXT PRIMARY KEY, taskId TEXT NOT NULL, tool TEXT NOT NULL, summary TEXT NOT NULL,
       argsDigest TEXT,
@@ -73,13 +78,14 @@ export class ComputerControlBroker {
     });
   }
 
-  submit({ taskId, tool, args = {} }) {
+  submit({ taskId, tool, args = {}, precondition, postcondition }) {
     this.expireStaleApprovals();
     if (typeof taskId !== 'string' || !SAFE_ID.test(taskId)) throw new TypeError('A valid taskId is required');
     if (!this.allowedTools.has(tool)) throw new Error('Computer tool is not allowed');
-    if (tool === 'type_text' && !this.interactiveAllowed) throw new Error('Interactive computer input is not enabled');
+    if (INTERACTIVE_COMPUTER_TOOLS.includes(tool) && !this.interactiveAllowed) throw new Error('Interactive computer input is not enabled');
     const summary = validateComputerAction(tool, args);
-    const { snapshot, digest } = snapshotArgs(args);
+    validateComputerConditions(precondition, postcondition, this.fileValidator);
+    const { snapshot, digest } = snapshotArgs({ args, precondition: precondition ?? null, postcondition: postcondition ?? null });
     const safe = safeSummary(summary), id = `ca-${randomUUID()}`, correlationId = randomUUID(), now = this.store.now();
     this.store.db.prepare(`INSERT INTO computer_actions(id,taskId,tool,summary,argsDigest,status,correlationId,createdAt,updatedAt)
       VALUES(?,?,?,?,?,'awaiting_approval',?,?,?)`).run(id, taskId, tool, safe, digest, correlationId, now, now);
@@ -98,6 +104,12 @@ export class ComputerControlBroker {
     if (!row || !ACTION_STATES.has(row.status)) return null;
     if (row.status === 'awaiting_approval') row.expiresAt = this.#expiryFor(row.createdAt);
     return row;
+  }
+  observationTargets(actionId) {
+    const observation = this.observations.get(actionId);
+    if (!observation || observation.expiresAt <= this.clock()) return [];
+    return [{ pid: observation.pid, window_id: observation.window_id, snapshot_id: observation.snapshot_id, observedAt: observation.observedAt,
+      elements: observation.elements.map(({ element_token, role, label }) => ({ element_token, role, label })) }];
   }
   list({ taskId } = {}) {
     this.expireStaleApprovals();
@@ -161,56 +173,112 @@ export class ComputerControlBroker {
       this.lease.release(action.taskId, leaseToken, { verifiedQuiescent: true });
       return this.get(actionId);
     }
+    let leaseLost = false;
+    const renewLease = () => { try { if (!this.lease.renew(action.taskId, leaseToken, { ttlMs: this.leaseTtlMs })) leaseLost = true; } catch { leaseLost = true; } };
+    const leaseRenewer = setInterval(renewLease, Math.max(500, Math.floor(this.leaseTtlMs / 3)));
+    const stopLeaseRenewer = () => clearInterval(leaseRenewer);
     this.liveArgs.delete(actionId);
+    const { args: actionArgs, precondition, postcondition } = args;
+    let activityBaseline = null;
+    const sampleActivity = async () => {
+      try {
+        if (typeof this.lease.sampleUserActivity !== 'function') return null;
+        const sample = await this.lease.sampleUserActivity();
+        return sample?.status === 'timestamp' && Number.isFinite(sample.timestamp) ? sample.timestamp : null;
+      } catch { return null; }
+    };
+    if (INTERACTIVE_COMPUTER_TOOLS.includes(action.tool)) activityBaseline = await sampleActivity();
     let rawResult;
     try {
-      rawResult = await this.client.call(action.tool, snapshotArgs(args).snapshot);
+      if (INTERACTIVE_COMPUTER_TOOLS.includes(action.tool)) {
+        const source = [...this.observations.entries()].find(([, o]) => o.expiresAt > this.clock() && o.pid === actionArgs.pid && o.window_id === actionArgs.window_id && o.elements.some(e => e.element_token === actionArgs.element_token));
+        if (!source) { stopLeaseRenewer(); this.lease.release(action.taskId, leaseToken, { verifiedQuiescent: true }); return this.#finish(actionId, 'failed', '找不到本中枢读取的有效目标快照或控件 token；未执行动作。'); }
+        this.observations.delete(source[0]);
+        const snapshot = source[1];
+        if (precondition?.titleContains && !snapshot.title.includes(precondition.titleContains)) { stopLeaseRenewer(); this.lease.release(action.taskId, leaseToken, { verifiedQuiescent: true }); return this.#finish(actionId, 'failed', '目标窗口未满足标题前置条件；未执行动作。'); }
+        const element = snapshot.elements.find(e => e.element_token === actionArgs.element_token);
+        if (precondition?.textContains && !`${element?.label || ''}\n${element?.value || ''}`.includes(precondition.textContains)) { stopLeaseRenewer(); this.lease.release(action.taskId, leaseToken, { verifiedQuiescent: true }); return this.#finish(actionId, 'failed', '目标控件未满足文本前置条件；未执行动作。'); }
+      }
+      rawResult = await this.client.call(action.tool, actionArgs);
     } catch {
+      stopLeaseRenewer();
       this.lease.markUncertain(action.taskId, leaseToken);
       return this.#finish(actionId, 'uncertain', '调用中断或结果不确定；不会自动重试。');
     }
+    if (action.tool === 'get_window_state' && rawResult?.isError !== true) {
+      const snapshot = rawResult?.structuredContent || rawResult;
+      if (snapshot?.snapshot_id && snapshot.pid === args.args.pid && snapshot.window_id === args.args.window_id && Array.isArray(snapshot.elements)) {
+        this.observations.set(actionId, { pid: snapshot.pid, window_id: snapshot.window_id, snapshot_id: snapshot.snapshot_id, observedAt: this.clock(), expiresAt: this.clock() + 30_000,
+          title: typeof snapshot.window_title === 'string' ? redact(snapshot.window_title).slice(0, 200) : '',
+          elements: snapshot.elements.filter(e => typeof e?.element_token === 'string').map(e => ({ element_token: e.element_token, role: typeof e.role === 'string' ? e.role.slice(0, 80) : '', label: typeof e.label === 'string' ? redact(e.label).slice(0, 120) : '', value: typeof e.value === 'string' ? redact(e.value).slice(0, 300) : '' })) });
+      }
+    }
     if(rawResult?.isError===true) {
-      if(action.tool==='type_text') {
+      if(INTERACTIVE_COMPUTER_TOOLS.includes(action.tool)) {
+        stopLeaseRenewer();
         this.lease.markUncertain(action.taskId,leaseToken);
         return this.#finish(actionId,'uncertain','输入工具返回错误，不能确认是否已有文字送达；桌面已锁定，请检查目标窗口。');
       }
       if(!this.lease.release(action.taskId,leaseToken,{verifiedQuiescent:true})) {
+        stopLeaseRenewer();
         this.lease.markUncertain(action.taskId,leaseToken);
         return this.#finish(actionId,'uncertain','只读检查返回错误且桌面租约状态不一致；需要人工检查。');
       }
       rawResult=undefined;
+      stopLeaseRenewer();
       return this.#finish(actionId,'failed','只读检查未成功；没有发送输入操作，请核对目标后重新申请。');
     }
-    if (action.tool === 'type_text') {
+    if (INTERACTIVE_COMPUTER_TOOLS.includes(action.tool)) {
       let observed;
-      try { observed = await this.client.call('get_window_state', { pid: args.pid, window_id: args.window_id }); }
+      try { observed = await this.client.call('get_window_state', { pid: actionArgs.pid, window_id: actionArgs.window_id }); }
       catch {
+        stopLeaseRenewer();
         this.lease.markUncertain(action.taskId, leaseToken);
         return this.#finish(actionId, 'uncertain', '文本输入后无法重新读取目标窗口；为避免重复已锁定桌面。');
       }
       const leaseAfterObserve=this.lease.current();
-      if(observed?.isError===true || leaseAfterObserve?.state!=='active' || leaseAfterObserve.token!==leaseToken || leaseAfterObserve.taskId!==action.taskId) {
+      const postEvidence = verifyWindowEvidence(observed, actionArgs, postcondition || {});
+      const activityAfterPostread = await sampleActivity();
+      let fileVerified = false;
+      if (postcondition?.path && this.fileValidator) {
+        try { fileVerified = (await this.fileValidator(postcondition.path, { action, receipt: rawResult })) === true; } catch { fileVerified = false; }
+      }
+      const hasWindowExpectation = Boolean(postcondition?.titleContains || postcondition?.textContains);
+      const hasFileExpectation = Boolean(postcondition?.path);
+      const allPostconditionsMatch = (!hasWindowExpectation || postEvidence.verified) && (!hasFileExpectation || fileVerified) && (hasWindowExpectation || hasFileExpectation);
+      if(observed?.isError===true || postEvidence.evidence === 'wrong-target' || !observed?.snapshot_id && !observed?.structuredContent?.snapshot_id || leaseLost || leaseAfterObserve?.state!=='active' || leaseAfterObserve.token!==leaseToken || leaseAfterObserve.taskId!==action.taskId) {
+        stopLeaseRenewer();
         this.lease.markUncertain(action.taskId,leaseToken);
         return this.#finish(actionId,'uncertain','文本输入后窗口复核未能确认；为避免重复已锁定桌面。');
       }
       this.store.db.prepare("UPDATE computer_actions SET status='verification_required',outcome=?,updatedAt=? WHERE id=? AND status='invoking'")
-        .run('文本已送达，等待你检查目标窗口并确认结果。',this.store.now(),actionId);
-      let lostLease=false;
-      const renewer=setInterval(()=>{try{if(!this.lease.renew(action.taskId,leaseToken,{ttlMs:this.leaseTtlMs}))lostLease=true;}catch{lostLease=true;}},Math.max(1000,Math.floor(this.leaseTtlMs/3)));
+        .run(allPostconditionsMatch ? '动作回执与后置条件证据匹配，等待用户确认。' : '动作已回执并重新读取窗口；语义结果待人工核验。',this.store.now(),actionId);
       try {
         if(typeof onResult==='function') await onResult({action,result:observed});
       } catch {
         // The text was already sent. Leave the action and desktop lease pending for manual review.
-      } finally { clearInterval(renewer); }
-      if(lostLease) {
+      } finally { /* lease renewal continues until all verification callbacks finish */ }
+      const activityAfterCallback = await sampleActivity();
+      const userTookOver = activityBaseline !== null && ((activityAfterPostread !== null && activityAfterPostread !== activityBaseline) || (activityAfterCallback !== null && activityAfterCallback !== activityBaseline));
+      if (userTookOver) {
+        stopLeaseRenewer();
+        try { this.lease.pauseForUser(); }
+        catch { this.lease.markUncertain(action.taskId, leaseToken); }
+        return this.#finish(actionId, 'uncertain', '检测到用户输入时间戳变化；桌面已让出，动作结果需人工核对，且不会重放。');
+      }
+      renewLease();
+      if(leaseLost) {
+        stopLeaseRenewer();
         this.lease.markUncertain(action.taskId,leaseToken);
         return this.#finish(actionId,'uncertain','窗口复核期间桌面租约失效；请检查桌面后手动恢复。');
       }
+      stopLeaseRenewer();
       return this.get(actionId);
     }
     const lease = this.lease.current();
     const persistedAction = this.get(actionId);
     if (persistedAction?.status !== 'invoking' || lease?.state !== 'active' || lease.token !== leaseToken || lease.taskId !== action.taskId || !this.lease.release(action.taskId, leaseToken, { verifiedQuiescent: true })) {
+      stopLeaseRenewer();
       this.lease.markUncertain(action.taskId, leaseToken);
       return this.#finish(actionId, 'uncertain', '只读检查已返回，但桌面租约状态不一致；需要人工检查。');
     }
@@ -226,6 +294,7 @@ export class ComputerControlBroker {
     // The callback can forward the result to a local model, but this broker
     // never persists or returns raw screen content.
     rawResult = undefined;
+    stopLeaseRenewer();
     return this.#finish(actionId, 'verified', outcome);
   }
 

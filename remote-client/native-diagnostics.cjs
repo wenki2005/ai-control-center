@@ -1,0 +1,5 @@
+'use strict';
+// Diagnostics cross the device boundary; credentials and token URLs must not.
+function safeDetail(value){return String(value||'').replace(/([?&](?:token|key|secret|auth)=)[^\s&#"']+/gi,'$1[已隐藏]').replace(/Bearer\s+[^\s"']+/gi,'Bearer [已隐藏]').replace(/((?:api[_-]?key|access[_-]?token|password|launchToken|token|cookie|authorization|secret)["']?\s*[=:]\s*["']?)[^\s,"'}]+/gi,'$1[已隐藏]').replace(/[\x00-\x1f]/g,' ').slice(0,400);}
+function parseDshLogin(value){let url;try{url=new URL(String(value).trim());}catch{throw Error('请复制本机DSH启动时提供的完整登录链接');}if(url.protocol!=='http:'||!['localhost','127.0.0.1','[::1]'].includes(url.hostname)||url.port!=='3080'||url.username||url.password||url.pathname!=='/'||url.searchParams.getAll('token').length!==1||!url.searchParams.get('token')||url.searchParams.get('token').length>1024)throw Error('只接受本机3080的DSH登录链接，需要包含token；该凭据不会上传');return {baseUrl:url.origin,launchToken:url.searchParams.get('token')};}
+module.exports={safeDetail,parseDshLogin};

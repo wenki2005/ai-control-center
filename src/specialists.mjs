@@ -1,9 +1,9 @@
-import {mkdirSync,readFileSync,writeFileSync,existsSync,lstatSync,copyFileSync,realpathSync,cpSync,renameSync,unlinkSync} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,existsSync,lstatSync,copyFileSync,realpathSync,cpSync,renameSync,unlinkSync,readdirSync,rmSync} from 'node:fs';
 import {join,resolve,relative,isAbsolute,dirname} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {redact,containsCredential} from './redact.mjs';
+import {redact,containsCredential,containsKnownCredential} from './redact.mjs';
 import {hasHumanReadableName} from './knowledge/share-policy.mjs';
 const execute=promisify(execFile),KINDS=['maintenance','librarian'];
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -38,6 +38,30 @@ function retryClass(error){
 function retryAt(now,attempts,kind){const base=kind==='quota'?60*60_000:60_000;return new Date(Date.parse(now)+base*2**Math.max(0,attempts)).toISOString();}
 const inside=(base,path)=>{const rel=relative(resolve(base),resolve(path));return !!rel && rel!=='..'&&!rel.startsWith('..\\')&&!rel.startsWith('../')&&!isAbsolute(rel);};
 function noLinks(base,path){let current=resolve(path);while(current!==resolve(base)){if(!inside(base,current))throw Error('路径越界');if(existsSync(current)&&lstatSync(current).isSymbolicLink())throw Error('维护目标经过目录跳转');current=dirname(current);}}
+const excludedSnapshotNames=new Set(['.git','.hg','.svn','runtime','maintenance-snapshots','node_modules','dist','build','coverage','.next','.cache','backups']);
+const excludedCredentialFiles=new Set(['credentials.json','credential.json','secrets.json','secret.json','tokens.json','token.json','auth.json','qq-config.json']);
+function includeSnapshotPath(source,root){
+  const parts=relative(root,source).split(/[\\/]/),name=parts.at(-1)||'';
+  if(parts.length>=2&&parts[0].toLowerCase()==='test'&&parts[1].toLowerCase()==='.tmp')return false;
+  if(parts.some(part=>excludedSnapshotNames.has(part.toLowerCase())))return false;
+  if(/^\.env(?:\.|$)/i.test(name)||excludedCredentialFiles.has(name.toLowerCase())||/\.(?:pem|key|p12|pfx|keystore|jks)$/i.test(name))return false;
+  if(existsSync(source)&&lstatSync(source).isSymbolicLink())throw Error(`维护快照遇到符号链接，已停止以免漏掉源码或越界：${relative(root,source)}`);
+  if(existsSync(source)&&lstatSync(source).isFile()){
+    const rel=relative(root,source),text=readFileSync(source,'utf8');
+    if(containsKnownCredential(text))throw Error(`维护快照发现已知运行凭据，已停止并保留隔离：${rel}`);
+    const syntheticTest=parts.length===2&&parts[0].toLowerCase()==='test'&&/\.test\.mjs$/i.test(name);
+    if(!syntheticTest&&/\.(?:[cm]?js|json|ya?ml|toml|ini|conf|txt|md|html|css|sql|sh|ps1|py|ts|tsx|jsx|xml|properties)$/i.test(name)&&containsCredential(text))
+      throw Error(`维护快照发现疑似凭据内容，已停止并保留隔离：${rel}`);
+  }
+  return true;
+}
+function assertSnapshotRepo(snapshotRoot,repo){
+  const root=resolve(snapshotRoot),target=resolve(repo);
+  if(target===root||!inside(root,target))throw Error('维护隔离仓库路径无效');
+  noLinks(dirname(root),root);noLinks(root,target);
+  if(existsSync(root)&&lstatSync(root).isSymbolicLink())throw Error('维护快照根目录不能是符号链接');
+  if(existsSync(target)&&lstatSync(target).isSymbolicLink())throw Error('维护隔离仓库不能是符号链接');
+}
 function atomicWrite(file,bytes){const temp=file+'.hub-'+randomUUID()+'.tmp';try{writeFileSync(temp,bytes);renameSync(temp,file);}finally{if(existsSync(temp))unlinkSync(temp);}}
 
 export class Specialists {
@@ -122,7 +146,9 @@ export class Specialists {
     // cleared or a database snapshot is restored. Reconcile by source error ID
     // against durable maintenance-job payloads so no outstanding error is
     // silently skipped and processed errors remain idempotent.
-    const errors=this.db.prepare(`SELECT e.rowid AS seq,e.* FROM errors e
+    // One owner for automatic fault repair. Keep manual maintenance and the
+    // librarian intact; never create a second DSH diagnosis for Codex-owned faults.
+    const errors=this.hub.codexAutoRepairThreadId ? [] : this.db.prepare(`SELECT e.rowid AS seq,e.* FROM errors e
       -- This poller already retries transient transport failures and clears
       -- its notice after the next successful sync. Spawning a full maintenance
       -- job for each hourly retry window creates noisy, redundant work.
@@ -149,7 +175,8 @@ export class Specialists {
   }
   async shell(command,args,cwd,timeout=90000){return this.runner(command,args,{cwd,windowsHide:true,timeout,maxBuffer:2*1024*1024});}
   async inspectMaintenanceRepo(repo) {
-    noLinks(this.runtime,repo);
+    const snapshotRoot=join(dirname(this.root),'ai-center-maintenance-snapshots');
+    try{assertSnapshotRepo(snapshotRoot,repo);}catch{return null;}
     if(!existsSync(repo)||lstatSync(repo).isSymbolicLink()||!lstatSync(repo).isDirectory())return null;
     try {
       const [top,origin,head,status]=await Promise.all([
@@ -168,12 +195,17 @@ export class Specialists {
     let repo;
     if(job.payload.repo && existsSync(job.payload.repo)) {
       repo=resolve(job.payload.repo);
-      if(!inside(join(agent.cwd,'repos'),repo))throw Error('维护任务保存的隔离仓库路径越界');
+      const snapshotRoot=join(dirname(this.root),'ai-center-maintenance-snapshots');
+      assertSnapshotRepo(snapshotRoot,repo);
       const state=await this.inspectMaintenanceRepo(repo);
       if(!state)throw Error('维护任务保存的隔离仓库无法验证；原目录已保留，请人工检查');
       return job.payload;
     }
-    const preferred=join(agent.cwd,'repos',job.id);mkdirSync(dirname(preferred),{recursive:true});
+    const snapshotRoot=join(dirname(this.root),'ai-center-maintenance-snapshots');
+    noLinks(dirname(snapshotRoot),snapshotRoot);
+    if(existsSync(snapshotRoot)&&lstatSync(snapshotRoot).isSymbolicLink())throw Error('维护快照根目录不能是符号链接');
+    const preferred=join(snapshotRoot,job.id);mkdirSync(snapshotRoot,{recursive:true});
+    assertSnapshotRepo(snapshotRoot,preferred);
     const existing=await this.inspectMaintenanceRepo(preferred);
     if(existing?.clean && existing.head===base)repo=preferred;
     else if(!existsSync(preferred))repo=preferred;
@@ -183,13 +215,25 @@ export class Specialists {
       repo=prior?.clean && prior.head===base ? recovery : (existsSync(recovery)?`${recovery}-${randomUUID().slice(0,8)}`:recovery);
     }
     if(existsSync(repo))throw Error('维护任务的恢复隔离目录已存在且无法验证；为保护原文件，已停止创建');
-    noLinks(this.runtime,repo);
+    assertSnapshotRepo(snapshotRoot,repo);
     await this.shell('git',['clone','--quiet','--no-hardlinks',this.root,repo],agent.cwd);
+    // Replace the HEAD-only checkout with a filtered copy of the live working tree.
+    assertSnapshotRepo(snapshotRoot,repo);
+    for(const name of readdirSync(repo))if(name!=='.git'){
+      const child=resolve(repo,name);
+      if(child===resolve(repo)||!inside(repo,child))throw Error('维护快照清理路径越界');
+      rmSync(child,{recursive:true,force:true});
+    }
+    cpSync(this.root,repo,{recursive:true,filter:source=>includeSnapshotPath(source,this.root)});
+    await this.shell('git',['-C',repo,'add','-f','-A'],this.root);
+    if((await this.shell('git',['-C',repo,'status','--porcelain'],this.root)).stdout.trim())
+      await this.shell('git',['-C',repo,'-c','user.name=AI Center Maintenance Snapshot','-c','user.email=maintenance-snapshot@localhost','commit','--quiet','-m','Isolated working-tree snapshot'],this.root);
     const cloned=await this.inspectMaintenanceRepo(repo);
-    if(!cloned || cloned.head!==base || !cloned.clean)throw Error('新建的维护隔离仓库未通过来源与基线校验');
+    if(!cloned || !cloned.clean)throw Error('新建的维护隔离仓库未通过来源与基线校验');
+    const snapshotHead=cloned.head;
     const dependencies=Object.keys(JSON.parse(readFileSync(join(repo,'package.json'),'utf8')).dependencies || {});
     for(const dependency of dependencies){const source=join(this.root,'node_modules',dependency),target=join(repo,'node_modules',dependency);mkdirSync(dirname(target),{recursive:true});cpSync(source,target,{recursive:true,filter:path=>!lstatSync(path).isSymbolicLink()});}
-    const payload={...job.payload,repo,baseCommit:base};this.updateJob(job.id,{payload});return payload;
+    const payload={...job.payload,repo,baseCommit:base,snapshotHead};this.updateJob(job.id,{payload});return payload;
   }
   snapshot(kind,reason) {
     const agent=this.agent(kind),jobs=this.db.prepare('SELECT id,status,result,error FROM specialist_jobs WHERE kind=? ORDER BY createdAt DESC LIMIT 12').all(kind);
@@ -216,7 +260,7 @@ export class Specialists {
     let instruction;
     if(job.kind==='maintenance') {
       const payload=await this.prepareMaintenance(job,agent);
-      instruction=`你是助手 AI 中枢的专职维护助手。只在隔离仓库 ${payload.repo} 内诊断和修复，不得修改线上项目 ${this.root}、原 QQ/DSH 配置或凭据，不得停止服务或部署。必要的源码部署由中控验证后执行。允许自动修复的文件仅 src/ 与 public/ 中已有文件或新文件；不允许删除、改 package/脚本/测试或凭据。既有测试必须保持原样并通过。\n维护请求：${JSON.stringify(payload)}\n把真实结论写入 ${join(output,'repair.json')}，JSON结构为 {"summary":"事实与验证","changes":["src/相对仓库路径或public/路径"]}。无可修源码时changes为空，清楚报告外部阻塞或服务已恢复。不要发明修复；修改前后可以运行 node --test test/*.test.mjs。最后一行必须输出中控 JSON 回执：[HUB-RESULT] {"status":"completed","summary":"简要结论","artifacts":["outputs/${taskId}/repair.json"]}。不要只写文件路径。`;
+      instruction=`你是助手 AI 中枢的专职维护助手。只在隔离仓库 ${payload.repo} 内诊断和修复，不得修改线上项目 ${this.root}、原 QQ/DSH 配置或凭据，不得停止服务或部署。必要的源码部署由中控验证后执行。允许自动修复的文件仅 src/ 与 public/ 中已有文件或新文件；不允许删除、改 package/脚本/测试或凭据。既有测试必须保持原样并通过。\n维护请求：${JSON.stringify({request:payload.request,error:payload.error,taskId:payload.taskId})}\n把真实结论写入 ${join(output,'repair.json')}，JSON结构为 {"summary":"事实与验证","changes":["src/相对仓库路径或public/路径"]}。无可修源码时changes为空，清楚报告外部阻塞或服务已恢复。不要发明修复；修改前后可以运行 node --test test/*.test.mjs。最后一行必须输出中控 JSON 回执：[HUB-RESULT] {"status":"completed","summary":"简要结论","artifacts":["outputs/${taskId}/repair.json"]}。不要只写文件路径。`;
     } else {
       const ids=job.payload.artifactIds || (await this.archive.list()).filter(file=>this.store.task(file.taskId)?.role!=='librarian').slice(0,12).map(file=>file.id);
       const records=(await Promise.all(ids.map(id=>this.archive.get(id)))).filter(Boolean);
@@ -285,7 +329,11 @@ export class Specialists {
     }
     const testChanges=(await this.shell('git',['diff','--name-only','HEAD','--','test','package.json','package-lock.json','scripts'],repo)).stdout.trim();
     if(testChanges)throw Error('维护会话修改了验证基线或启动脚本，不自动部署');
-    const tests=await this.shell(process.execPath,['--test','test/*.test.mjs'],repo);
+    const testFiles=readdirSync(join(repo,'test'),{withFileTypes:true})
+      .filter(entry=>entry.isFile() && /^.+\.test\.mjs$/i.test(entry.name))
+      .map(entry=>join(repo,'test',entry.name)).sort();
+    if(!testFiles.length)throw Error('维护仓库没有可运行的项目测试');
+    const tests=await this.shell(process.execPath,['--test',...testFiles],repo);
     writeFileSync(join(task.cwd,'outputs',task.id,'validation.txt'),redact(tests.stdout).slice(0,100000));
     return {summary:redact(report.summary).slice(0,4000),changes,baseCommit:job.payload.baseCommit,repo};
   }

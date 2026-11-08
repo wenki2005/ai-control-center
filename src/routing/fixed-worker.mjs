@@ -1,4 +1,5 @@
 import { basename, dirname, join, resolve } from 'node:path';
+import { workTopicScore } from '../hub/work-handoff.mjs';
 
 const ENGINES = new Set(['dsh', 'codex', 'workbuddy']);
 
@@ -26,9 +27,9 @@ function metadataFor(store, engine, cwd) {
 
 export function fixedWorkerSlotCount(engine) {
   if (!validEngine(engine)) throw new TypeError('Unsupported fixed worker engine');
-  // Keep existing DSH work on its established slot and add one isolated
-  // session for parallel work. Codex/WorkBuddy remain single-session workers.
-  return engine === 'dsh' ? 2 : 1;
+  // Three general seats plus one dedicated phone-control seat.
+  // Sessions are created on first assignment, then reused.
+  return engine === 'dsh' ? 3 : 1;
 }
 
 function slotCwd(workspaceRoot, engine, slot) {
@@ -46,7 +47,7 @@ function slotForPath(engine, cwd) {
 export function fixedWorkerContext({ store, engine, workspaceRoot, slot = 1 } = {}) {
   if (!validEngine(engine)) throw new TypeError('Unsupported fixed worker engine');
   if (typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) throw new TypeError('workspaceRoot is required');
-  if (!Number.isInteger(slot) || slot < 1 || slot > fixedWorkerSlotCount(engine)) throw new TypeError('Invalid fixed worker slot');
+  if (!Number.isInteger(slot) || slot < 1 || (slot > fixedWorkerSlotCount(engine) && !(engine==='dsh' && slot===4))) throw new TypeError('Invalid fixed worker slot');
   const cwd = slotCwd(workspaceRoot, engine, slot);
   const saved = metadataFor(store, engine, cwd);
   const context = { cwd, sessionId: saved?.sessionId ?? null, sourceTaskId: saved?.taskId ?? null };
@@ -55,16 +56,21 @@ export function fixedWorkerContext({ store, engine, workspaceRoot, slot = 1 } = 
 }
 
 /** Choose an idle slot first; if all are busy, choose the one with the shortest queue. */
-export function selectFixedWorkerContext({ store, engine, workspaceRoot } = {}) {
+export function selectFixedWorkerContext({ store, engine, workspaceRoot, preferredSlot, prompt='' } = {}) {
+  if(engine==='dsh'&&preferredSlot===4)return fixedWorkerContext({store,engine,workspaceRoot,slot:4});
   const contexts = Array.from({ length: fixedWorkerSlotCount(engine) }, (_, index) => fixedWorkerContext({ store, engine, workspaceRoot, slot: index + 1 }));
   const loads = contexts.map(context => store?.db?.prepare(`SELECT COUNT(*) AS n FROM tasks t
     WHERE t.role='worker' AND t.engine=? AND t.cwd=? AND t.status IN ('queued','running','waiting')
       AND EXISTS (SELECT 1 FROM events e WHERE e.taskId=t.id AND e.type='task.fixed-worker')`).get(engine, context.cwd)?.n ?? 0);
-  return contexts[loads.indexOf(Math.min(...loads))] ?? contexts[0];
+  const minimum=Math.min(...loads),preferred=contexts.findIndex(context=>context.slot===preferredSlot);
+  const affinity=contexts.map((context,index)=>({index,score:prompt&&loads[index]===0&&context.sourceTaskId?workTopicScore(prompt,store.task(context.sourceTaskId)||{}):0})).sort((a,b)=>b.score-a.score);
+  if(affinity[0]?.score>=0.55)return contexts[affinity[0].index];
+  if(preferred>=0&&loads[preferred]===minimum)return contexts[preferred];
+  return contexts[loads.indexOf(minimum)] ?? contexts[0];
 }
 
 export function fixedWorkerHasPending({ store, engine, slot, workspaceRoot } = {}) {
-  if (!validEngine(engine) || !store?.db || !workspaceRoot || !Number.isInteger(slot)) return false;
+  if (!validEngine(engine) || !store?.db || !workspaceRoot || !Number.isInteger(slot) || (slot>fixedWorkerSlotCount(engine)&&!(engine==='dsh'&&slot===4))) return false;
   const cwd = slotCwd(workspaceRoot, engine, slot);
   return Boolean(store.db.prepare(`SELECT 1 FROM tasks t
     WHERE t.role='worker' AND t.engine=? AND t.cwd=? AND t.status IN ('queued','running','waiting')
@@ -73,7 +79,7 @@ export function fixedWorkerHasPending({ store, engine, slot, workspaceRoot } = {
 
 export function fixedWorkerSlotForTask(task, workspaceRoot) {
   if (!task?.engine || !task?.cwd || !validEngine(task.engine)) return 1;
-  for (let slot = 1; slot <= fixedWorkerSlotCount(task.engine); slot++) {
+  for (const slot of task.engine==='dsh'?[1,2,3,4]:[1]) {
     if (samePath(task.cwd, slotCwd(workspaceRoot, task.engine, slot))) return slot;
   }
   return 1;
@@ -89,7 +95,7 @@ export function rememberFixedWorker({ store, task, sessionId } = {}) {
   const cwd = typeof task.cwd === 'string' ? task.cwd : '';
   // The task itself must already be in the dedicated slot. Never adopt a user session.
   const slot = slotForPath(task.engine, cwd);
-  if (!cwd || ![task.engine, `${task.engine}-${slot}`].includes(basename(cwd).toLowerCase()) || basename(dirname(cwd)).toLowerCase() !== '_workers' || slot > fixedWorkerSlotCount(task.engine)) return false;
+  if (!cwd || ![task.engine, `${task.engine}-${slot}`].includes(basename(cwd).toLowerCase()) || basename(dirname(cwd)).toLowerCase() !== '_workers' || (slot > fixedWorkerSlotCount(task.engine) && !(task.engine==='dsh'&&slot===4))) return false;
   store.meta(`worker:fixed:${task.engine}${slot === 1 ? '' : `:${slot}`}`, JSON.stringify({ sessionId, cwd, taskId: task.id }));
   return true;
 }
@@ -97,7 +103,7 @@ export function rememberFixedWorker({ store, task, sessionId } = {}) {
 /** True only while a marked fixed-slot worker for this engine is active. */
 export function fixedWorkerBusy({ store, engine, slot = null, excludingTaskId = null, workspaceRoot = null } = {}) {
   if (!validEngine(engine) || !store?.db) return false;
-  if (slot !== null && (!Number.isInteger(slot) || slot < 1 || slot > fixedWorkerSlotCount(engine))) return false;
+  if (slot !== null && (!Number.isInteger(slot) || slot < 1 || (slot>fixedWorkerSlotCount(engine)&&!(engine==='dsh'&&slot===4)))) return false;
   const sql = `SELECT 1 FROM tasks t
     WHERE t.role='worker' AND t.engine=? AND t.status IN ('running','waiting')
       AND (? IS NULL OR t.id<>?)
@@ -107,3 +113,4 @@ export function fixedWorkerBusy({ store, engine, slot = null, excludingTaskId = 
       : null;
   return Boolean(row);
 }
+

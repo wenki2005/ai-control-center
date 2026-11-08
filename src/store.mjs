@@ -1,3 +1,5 @@
+import {EventJournal} from './observability/event-journal.mjs';
+import {ensureDeliveryLedger,deliveryGroup} from './qq-delivery-ledger.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -27,6 +29,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,taskId TEXT,type TEXT NOT NULL,data TEXT,createdAt TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS errors(id TEXT PRIMARY KEY,taskId TEXT,message TEXT NOT NULL,createdAt TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chat(id INTEGER PRIMARY KEY AUTOINCREMENT,role TEXT NOT NULL,text TEXT NOT NULL,createdAt TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS chat_context_exclusions(chatId INTEGER PRIMARY KEY REFERENCES chat(id),source TEXT NOT NULL,createdAt TEXT NOT NULL);
+      CREATE VIEW IF NOT EXISTS companion_chat AS SELECT c.* FROM chat c
+        WHERE NOT EXISTS(SELECT 1 FROM chat_context_exclusions x WHERE x.chatId=c.id);
       CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,dedupe TEXT UNIQUE,text TEXT NOT NULL,status TEXT NOT NULL,
         attempts INTEGER DEFAULT 0,error TEXT,createdAt TEXT NOT NULL,updatedAt TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS attachment_outbox(id TEXT PRIMARY KEY,dedupe TEXT UNIQUE,artifactId TEXT NOT NULL,
@@ -55,13 +60,19 @@ export class Store {
     this.db.exec(`CREATE INDEX IF NOT EXISTS events_task_type_id ON events(taskId,type,id);
       CREATE INDEX IF NOT EXISTS events_type_id ON events(type,id);
       CREATE INDEX IF NOT EXISTS events_created_type ON events(createdAt,type);
-      CREATE INDEX IF NOT EXISTS tasks_role_status_created ON tasks(role,status,createdAt)`);
+      CREATE INDEX IF NOT EXISTS tasks_role_status_created ON tasks(role,status,createdAt);
+      CREATE INDEX IF NOT EXISTS tasks_session_role_created ON tasks(sessionId,role,createdAt)`);
     const outboxColumns=new Set(this.db.prepare('PRAGMA table_info(outbox)').all().map(row=>row.name));
     if(!outboxColumns.has('messageId'))this.db.exec('ALTER TABLE outbox ADD COLUMN messageId TEXT');
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS outbox_message_id_unique ON outbox(messageId)');
     for(const row of this.db.prepare('SELECT id,dedupe FROM outbox WHERE messageId IS NULL OR messageId=\'\'').all()) {
       this.db.prepare('UPDATE outbox SET messageId=? WHERE id=?').run(stableNotificationId(row.dedupe),row.id);
     }
+    this.db.exec('CREATE INDEX IF NOT EXISTS events_task_type_time ON events(taskId,type,createdAt)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS tasks_session_role_created ON tasks(sessionId,role,createdAt); CREATE INDEX IF NOT EXISTS events_task_type_id ON events(taskId,type,id)');
+    this.db.exec("CREATE INDEX IF NOT EXISTS events_dispatch_child ON events(json_extract(data,'$.workerId')) WHERE type='director.worker-created' AND json_valid(data)");
+    this.db.exec('CREATE INDEX IF NOT EXISTS tasks_created_order ON tasks(createdAt DESC)');
+    ensureDeliveryLedger(this);
     this.#initializeCompanionSearch();
   }
   #initializeCompanionSearch() {
@@ -98,6 +109,7 @@ export class Store {
   }
   task(id) { return this.db.prepare('SELECT * FROM tasks WHERE id=?').get(id) || null; }
   tasks() { return this.db.prepare('SELECT * FROM tasks ORDER BY createdAt DESC LIMIT 200').all(); }
+  taskSummaries() { return this.db.prepare('SELECT id,engine,role,prompt,model,status,sessionId,cwd,projectPath,createdAt,updatedAt FROM tasks ORDER BY createdAt DESC LIMIT 200').all(); }
   allTasks() { return this.db.prepare('SELECT * FROM tasks ORDER BY createdAt DESC').all(); }
   update(id, patch) {
     const allowed = new Set(['sessionId','status','result','error','prompt','model','runVersion','engine','projectPath']);
@@ -108,32 +120,10 @@ export class Store {
     return this.task(id);
   }
   event(taskId, type, data) {
-    const safeData=redact(data),createdAt=this.now();
-    // Engine message events are cumulative stream snapshots. Retain one latest
-    // snapshot per task run; final text and all lifecycle events remain in the
-    // durable task/event history, while repeated full transcripts stop growing
-    // the SQLite event log on every token update.
-    if(type==='message'&&taskId) {
-      const previous=this.db.prepare(`SELECT data FROM events AS message WHERE taskId=? AND type='message'
-        AND id>(SELECT COALESCE(MAX(id),0) FROM events WHERE taskId=? AND type='task.started')
-        AND NOT EXISTS(SELECT 1 FROM events AS later WHERE later.taskId=message.taskId AND later.id>message.id AND later.type<>'message')
-        ORDER BY id DESC LIMIT 1`).get(taskId,taskId);
-      if(previous?.data) {
-        try {
-          const prior=JSON.parse(previous.data);
-          if(safeData&&typeof safeData==='object'&&!safeData.usage&&prior.usage)safeData.usage=prior.usage;
-        } catch { /* A malformed prior snapshot must not block current evidence. */ }
-      }
-      const serialized=JSON.stringify(safeData);
-      const updated=this.db.prepare(`UPDATE events SET data=?,createdAt=? WHERE id=(
-        SELECT id FROM events WHERE taskId=? AND type='message'
-          AND id>(SELECT COALESCE(MAX(id),0) FROM events WHERE taskId=? AND type='task.started')
-          AND NOT EXISTS(SELECT 1 FROM events AS later WHERE later.taskId=events.taskId AND later.id>events.id AND later.type<>'message')
-        ORDER BY id DESC LIMIT 1)`).run(serialized,createdAt,taskId,taskId).changes;
-      if(updated)return;
-    }
-    this.db.prepare('INSERT INTO events(taskId,type,data,createdAt) VALUES(?,?,?,?)').run(taskId,type,JSON.stringify(safeData),createdAt);
+    this.eventJournal ||= new EventJournal(this.db);
+    this.eventJournal.write(taskId,type,redact(data),this.now());
   }
+
   error(taskId, message) {
     const record = { id:randomUUID(),taskId:taskId || null,message:redact(String(message)).slice(0,4000),createdAt:this.now() };
     this.db.prepare('INSERT INTO errors VALUES(?,?,?,?)').run(record.id,record.taskId,record.message,record.createdAt); return record;
@@ -152,9 +142,10 @@ export class Store {
       return this.db.prepare(`DELETE FROM errors WHERE id IN (${placeholders})`).run(...values).changes;
     });
   }
-  say(role,text) {
+  say(role,text,{source='companion'}={}) {
     const safe=redact(String(text)).slice(0,20000);
     const result=this.db.prepare('INSERT INTO chat(role,text,createdAt) VALUES(?,?,?)').run(role,safe,this.now());
+    if(source!=='companion')this.db.prepare('INSERT INTO chat_context_exclusions(chatId,source,createdAt) VALUES(?,?,?)').run(result.lastInsertRowid,String(source),this.now());
     if(this.companionSearchAvailable) {
       try {
         const tokens=companionSearchDocument(safe);
@@ -173,13 +164,15 @@ export class Store {
     try {
       return this.db.prepare(`SELECT c.id,c.role,c.text,c.createdAt,bm25(companion_chat_fts) AS searchRank
         FROM companion_chat_fts JOIN chat c ON c.id=companion_chat_fts.rowid
-        WHERE companion_chat_fts MATCH ? ORDER BY bm25(companion_chat_fts),c.id DESC LIMIT ?`).all(match,bounded);
+        WHERE companion_chat_fts MATCH ? AND NOT EXISTS(SELECT 1 FROM chat_context_exclusions x WHERE x.chatId=c.id)
+        ORDER BY bm25(companion_chat_fts),c.id DESC LIMIT ?`).all(match,bounded);
     } catch {
       this.companionSearchAvailable=false;
       return [];
     }
   }
   chat() { return this.db.prepare('SELECT * FROM (SELECT * FROM chat ORDER BY id DESC LIMIT 100) ORDER BY id').all(); }
+  conversationChat() { return this.db.prepare('SELECT * FROM (SELECT * FROM companion_chat WHERE retractedAt IS NULL ORDER BY id DESC LIMIT 100) ORDER BY id').all(); }
   approval(taskId, event) {
     const requestId=String(event.requestId), now=this.now();
     this.db.prepare('INSERT OR IGNORE INTO approvals VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(
@@ -217,9 +210,9 @@ export class Store {
   enqueue(text,dedupe) {
     const now=this.now();
     if(!String(dedupe || '').trim())throw Error('QQ 通知必须提供稳定去重键');
-    const messageId=stableNotificationId(dedupe);
-    this.db.prepare('INSERT OR IGNORE INTO outbox(id,dedupe,text,status,createdAt,updatedAt,messageId) VALUES(?,?,?,?,?,?,?)')
-      .run(randomUUID(),String(dedupe),redact(String(text)).slice(0,1800),'pending',now,now,messageId);
+    const messageId=stableNotificationId(dedupe),group=deliveryGroup(String(dedupe));
+    this.db.prepare('INSERT OR IGNORE INTO outbox(id,dedupe,text,status,createdAt,updatedAt,messageId,deliveryGroup,partIndex) VALUES(?,?,?,?,?,?,?,?,?)')
+      .run(randomUUID(),String(dedupe),redact(String(text)).slice(0,1800),'pending',now,now,messageId,group.group,group.index);
     return this.db.prepare('SELECT * FROM outbox WHERE dedupe=?').get(String(dedupe));
   }
   pendingNotifications() { return this.db.prepare("SELECT * FROM outbox WHERE status='pending' ORDER BY createdAt,rowid LIMIT 10").all(); }
@@ -267,7 +260,7 @@ export class Store {
     const result=this.db.prepare('INSERT OR IGNORE INTO inbound VALUES(?,?)').run(String(id),this.now());
     return result.changes>0;
   }
-  saveIncoming(id,text,attachments=[]) {const now=this.now(),safe=Array.isArray(attachments)?attachments.slice(0,4).map(value=>String(value)):[];this.db.prepare('INSERT OR IGNORE INTO inbox(messageId,text,status,createdAt,updatedAt,attachments) VALUES(?,?,?,?,?,?)').run(String(id),redact(text),'pending',now,now,JSON.stringify(redact(safe)));return this.db.prepare('SELECT * FROM inbox WHERE messageId=?').get(String(id));}
+  saveIncoming(id,text,attachments=[]) {const now=this.now(),safe=Array.isArray(attachments)?attachments.slice(0,4).filter(value=>typeof value==='string' || (value&&typeof value==='object'&&typeof value.path==='string')).map(value=>typeof value==='string'?value:{path:String(value.path),originalName:String(value.originalName||''),size:Number(value.size)||0,mimeType:String(value.mimeType||'application/octet-stream'),extension:String(value.extension||''),isImage:value.isImage===true,source:String(value.source||'qq'),messageId:String(value.messageId||id),receivedAt:String(value.receivedAt||now)}):[];this.db.prepare('INSERT OR IGNORE INTO inbox(messageId,text,status,createdAt,updatedAt,attachments) VALUES(?,?,?,?,?,?)').run(String(id),redact(text),'pending',now,now,JSON.stringify(redact(safe)));return this.db.prepare('SELECT * FROM inbox WHERE messageId=?').get(String(id));}
   incomingDone(id){this.db.prepare("UPDATE inbox SET status='done',lastError=NULL,nextAttemptAt=NULL,updatedAt=? WHERE messageId=?").run(this.now(),String(id));}
   retryIncoming(id,error,{maxAttempts=12,delayMs=5000}={}) {
     const row=this.db.prepare('SELECT attempts FROM inbox WHERE messageId=?').get(String(id));
@@ -301,5 +294,5 @@ export class Store {
     return this.directorHandoff(id);
   }
   meta(key,value){if(value!==undefined)this.db.prepare('INSERT INTO metadata VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);return this.db.prepare('SELECT value FROM metadata WHERE key=?').get(key)?.value;}
-  close() { this.db.close(); }
+  close() { this.eventJournal?.close();this.db.close(); }
 }

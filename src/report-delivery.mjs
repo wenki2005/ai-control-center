@@ -1,7 +1,9 @@
 // Persists a narrator report and the exact chunks Hub.notification placed in
 // the durable outbox. Hub.notification enqueues synchronously before it kicks
 // its asynchronous sender, so the manifest can be captured in this transaction.
+const initializedSchemas=new WeakSet();
 export function ensureReportDeliverySchema(db) {
+  if(initializedSchemas.has(db))return;
   db.exec(`CREATE TABLE IF NOT EXISTS report_notifications(
     key TEXT PRIMARY KEY,taskId TEXT,body TEXT NOT NULL,manifest TEXT,status TEXT NOT NULL DEFAULT 'queued',createdAt TEXT,updatedAt TEXT
   ); CREATE TABLE IF NOT EXISTS report_requests(
@@ -14,6 +16,8 @@ export function ensureReportDeliverySchema(db) {
   if(!cols.has('status'))db.exec("ALTER TABLE report_notifications ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'");
   if(!cols.has('createdAt'))db.exec('ALTER TABLE report_notifications ADD COLUMN createdAt TEXT');
   if(!cols.has('updatedAt'))db.exec('ALTER TABLE report_notifications ADD COLUMN updatedAt TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS report_notifications_task ON report_notifications(taskId)');
+  initializedSchemas.add(db);
 }
 
 export function persistNamedRequest(store,{key,task,kind,situation,artifacts=[]}) {
@@ -38,7 +42,7 @@ export function claimNamedRequest(store,key,{leaseMs=120000}={}) {
 }
 
 export function settleNamedRequest(store,key,status='queued') {
-  store.db.prepare('UPDATE report_requests SET status=?,leaseUntil=NULL,nextAttemptAt=NULL,updatedAt=? WHERE key=?').run(status,store.now(),key);
+  store.db.prepare('UPDATE report_requests SET status=?,leaseUntil=NULL,nextAttemptAt=NULL,updatedAt=? WHERE key=? AND (status<>? OR leaseUntil IS NOT NULL OR nextAttemptAt IS NOT NULL)').run(status,store.now(),key,status);
 }
 
 export function releaseNamedRequest(store,key) {
@@ -84,13 +88,13 @@ export function reconcileNamedReportDelivery(store,key) {
   else if(statuses.every(value=>value==='sent'))status='sent';
   else if(statuses.every(value=>value==='sent'||value==='suppressed')&&statuses.includes('suppressed'))status='suppressed';
   else if(statuses.includes('sent')||statuses.includes('suppressed'))status='partial';
-  store.db.prepare('UPDATE report_notifications SET status=?,updatedAt=? WHERE key=?').run(status,store.now(),key);
+  if(status!==row.status)store.db.prepare('UPDATE report_notifications SET status=?,updatedAt=? WHERE key=?').run(status,store.now(),key);
   return {...row,status};
 }
 
 export function reconcileAllNamedReportDeliveries(store) {
   ensureReportDeliverySchema(store.db);
-  for(const row of store.db.prepare('SELECT key FROM report_notifications').all())reconcileNamedReportDelivery(store,row.key);
+  for(const row of store.db.prepare("SELECT key FROM report_notifications WHERE status NOT IN ('sent','suppressed')").all())reconcileNamedReportDelivery(store,row.key);
 }
 
 export function enqueueNamedReportDelivery({store,hub,key,dedupe,text,taskId=null}) {

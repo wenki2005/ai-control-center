@@ -1,4 +1,5 @@
 const PENDING_KEY='control:pending-confirmation';
+import{parseStopRequest}from'./stop-request.mjs';
 const TTL_MS=120_000;
 
 const commands=new Map([
@@ -9,7 +10,7 @@ const commands=new Map([
   ['停掉当前任务','停掉当前任务'],['停止当前任务','停止当前任务'],['取消当前任务','取消当前任务'],
   ['停止所有任务','停止所有任务'],['取消全部任务','取消全部任务'],
 ]);
-const confirmations=new Set(['确认退出','确认关闭','确认停止','确认执行']);
+const confirmations=new Set(['确认退出','确认关闭','确认停止','确认执行','确认强制停止']);
 const cancellations=new Set(['取消','算了','不退出','不关闭','不停止']);
 const taskCommandPattern=/^(?:取消|停止任务|终止任务)\s+(t-[\w-]{4,})$/iu;
 const namedStopPattern=/^(?:(?:请|麻烦|帮我)\s*)?(?:停掉|停止任务|终止任务)\s+.{1,100}$|^(?:停止|停一下|stop|cancel)$/iu;
@@ -44,12 +45,12 @@ function askReply(command) {
         ?`这会停止指定任务“${taskCommandPattern.exec(normalized(command))?.[1]||''}”。`
         :command==='停掉当前任务'||command==='停止当前任务'||command==='取消当前任务'
       ?'这会停止当前任务。'
-      :'这会关闭当前直连或修复窗口。';
+      :parseStopRequest(command)?'这会中断指定任务，并停止后续自动接续。':'这会关闭当前直连或修复窗口。';
   return `你要执行“${command}”。${effect}请在 120 秒内回复“确认退出”“确认关闭”“确认停止”或“确认执行”；回复“算了”可取消。`;
 }
 
 /** Require an explicit same-source confirmation before executing control commands. */
-export function guardControlCommand({store,text,source='web',now=Date.now()}={}) {
+export function guardControlCommand({store,text,source='web',now=Date.now(),resolveStopTargets}={}) {
   if(!store?.meta)throw new TypeError('store.meta is required');
   const sourceName=String(source||'web');
   const input=String(text??'');
@@ -65,14 +66,16 @@ export function guardControlCommand({store,text,source='web',now=Date.now()}={})
     }
     if(confirmations.has(normalizedText)) {
       clearPending(store);
-      return {confirmed:true,command:pending.command,chatSource:pending.source};
+      return {confirmed:true,command:pending.command,chatSource:pending.source,...(Array.isArray(pending.targetIds)?{targetIds:pending.targetIds}:{})};
     }
   }
 
   const targeted=taskCommandPattern.exec(normalizedText);
-  const command=commands.get(normalizedText)||(targeted||namedStopPattern.test(input.trim())?input.trim():null);
+  const stop=parseStopRequest(input);
+  const command=commands.get(normalizedText)||(targeted||namedStopPattern.test(input.trim())||stop?input.trim():null);
   if(command) {
     const record={command:input.trim(),source:sourceName,expiresAt:at+TTL_MS};
+    if(stop&&typeof resolveStopTargets==='function')record.targetIds=resolveStopTargets(stop).map(task=>task.id);
     store.meta(PENDING_KEY,JSON.stringify(record));
     return {pending:true,reply:askReply(record.command)};
   }

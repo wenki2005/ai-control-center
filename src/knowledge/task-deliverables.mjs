@@ -42,8 +42,9 @@ export function isDeclaredDeliverable(task,artifact) {
   return taskFileReferences(task).some(file=>normalized(file)===normalized(artifact.sourcePath));
 }
 
-export async function collectTaskDeliverables({task,archive,workspaceRoot}) {
-  const references=taskFileReferences(task),warnings=[];
+export async function collectTaskDeliverables({task,archive,workspaceRoot,verifiedDelivery=null}) {
+  if(verifiedDelivery&&(!/^-?\d+$/.test(String(verifiedDelivery.messageId))||!Number.isFinite(verifiedDelivery.time)||!String(task.prompt).replaceAll('\\','/').includes(verifiedDelivery.path.replaceAll('\\','/'))||path.basename(verifiedDelivery.path)!==verifiedDelivery.name))throw Error('外部文件缺少本轮明确路径与平台回执');
+  const references=verifiedDelivery?[path.resolve(verifiedDelivery.path)]:taskFileReferences(task),warnings=[];
   if(!references.length)return [];
   if(!/^t-[\w-]+$/u.test(task.id))throw Error('成果任务编号无效');
   const cwd=await realpath(task.cwd);await rejectLinks(path.resolve(task.cwd));
@@ -53,8 +54,9 @@ export async function collectTaskDeliverables({task,archive,workspaceRoot}) {
   const copied=new Map();let total=0;
   for(const file of references) {
     try {
-      await rejectLinks(file);const source=await realpath(file);if(!within(cwd,source))throw Error('成果文件不在本任务项目中');
+      await rejectLinks(file);const source=await realpath(file);if(!within(cwd,source)&&!(verifiedDelivery&&normalized(source)===normalized(verifiedDelivery.path)))throw Error('成果文件不在本任务项目中');
       const info=await lstat(source);if(!info.isFile() || info.size>20*1024*1024 || total+info.size>60*1024*1024)throw Error('成果文件不是常规文件或超过自动发送大小');
+      if(verifiedDelivery&&(info.mtimeMs>verifiedDelivery.time*1000+1000||!isQqShareableArtifact({name:verifiedDelivery.name,isImage:IMAGE.test(verifiedDelivery.name)})))throw Error('已发送文件的当前版本或名称无法确认');
       const handle=await open(source,constants.O_RDONLY);let buffer;
       try{const before=await handle.stat();if(!before.isFile() || before.ino!==info.ino || before.dev!==info.dev || before.size!==info.size)throw Error('成果文件正在变化');buffer=await handle.readFile();const after=await handle.stat();if(buffer.length!==before.size || after.ino!==before.ino || after.dev!==before.dev || after.size!==before.size || after.mtimeMs!==before.mtimeMs)throw Error('成果文件正在变化');}finally{await handle.close();}
       const name=path.basename(source);if(copied.has(name))continue;

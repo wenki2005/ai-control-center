@@ -92,6 +92,7 @@ export function createDirectorTools({ defineTool, fetchImpl=fetch, baseUrl='http
         engine:{type:'string',required:true,description:'执行引擎：dsh、codex 或 workbuddy（文件读写整理）'},
         prompt:{type:'string',required:true,description:'通常 1 至 3 句，忠实保留用户目标和明确约束；不要自行添加目录、回复篇幅或固定回话，也不要附加用户未要求的限制。'},
         project:{type:'string',description:'仅在用户指定项目或当前项目列表能明确对应时填写已有项目名；无法确定时省略。'},
+        contextTaskId:{type:'string',description:'续接相关工作时填写已查到的前次任务引用，不猜编号。'},
       },
       output:{schema:{type:'string'},render:(_args,value)=>textOutput(value)},
       async execute(args,exec) {
@@ -101,10 +102,23 @@ export function createDirectorTools({ defineTool, fetchImpl=fetch, baseUrl='http
         await currentDirector(exec,args.requestId);
         const sessionId=nativeCallerSessionId(exec);
         const dispatchKey=createHash('sha256').update(args.engine+'\0'+args.prompt.trim()+'\0'+(args.project||'')).digest('hex').slice(0,24);
-        const result=await api('/api/director/delegate',{method:'POST',body:{requestId:args.requestId,sessionId,engine:args.engine,prompt:args.prompt.trim(),dispatchKey,...(args.project?{project:args.project}:{})},signal:exec.signal});
+        const result=await api('/api/director/delegate',{method:'POST',body:{requestId:args.requestId,sessionId,engine:args.engine,prompt:args.prompt.trim(),dispatchKey,...(args.project?{project:args.project}:{}),...(args.contextTaskId?{contextTaskId:args.contextTaskId}:{})},signal:exec.signal});
         const task=result.task ?? result;
         if(!task?.id)throw new Error('Hub 没有确认任务 ID');
         return `二级协调会话「${task.sessionTitle || '任务协调'}」已接手安排工作会话。请自然简短地告诉用户已经开始安排，后续由二级协调确认实际承接会话；不要提及任务编号。不要等待或执行任务。`;
+      },
+    }),
+    defineTool({
+      name:'director_native_session',
+      description:'远端/另一台电脑的会话必须scope=remote，直接用本工具，不派本机worker；devices查设备，status带remoteRequestId核对处理结果，不重复发送。查询指定原生会话的进度、历史或错误时直接使用本工具，不派固定工作会话代查。仅当用户明确要求向指定会话发送消息或续接时使用 message，并把用户原话简短传递。模糊标题只列候选，由用户指定后再操作。',
+      parameters:{scope:{type:'string',description:'local本机或remote远端'},deviceId:{type:'string'},remoteRequestId:{type:'string'},requestId:{type:'string',required:true},sessionId:{type:'string',required:true,description:'本主管会话身份'},engine:{type:'string',required:true,description:'dsh、codex 或 workbuddy'},action:{type:'string',required:true,description:'list、read 或 message'},targetSessionId:{type:'string',description:'目标原生会话 ID'},query:{type:'string',description:'列表筛选关键词'},text:{type:'string',description:'用户明确要求发送的原话'}},
+      output:{schema:{type:'string'},render:(_args,value)=>textOutput(value)},
+      async execute(args,exec) {
+        if(!['dsh','codex','workbuddy'].includes(args.engine)||!['devices','list','read','message','status'].includes(args.action))throw new Error('引擎或操作无效');
+        await currentDirector(exec,args.requestId);
+        if(args.action==='message'&&(!args.targetSessionId||!String(args.text||'').trim()))throw new Error('发送消息需要指定会话和内容');
+        const value=await api('/api/director/native-session',{method:'POST',body:{requestId:args.requestId,sessionId:nativeCallerSessionId(exec),engine:args.engine,action:args.action,...(args.scope?{scope:args.scope}:{}),...(args.deviceId?{deviceId:args.deviceId}:{}),...(args.remoteRequestId?{remoteRequestId:args.remoteRequestId}:{}),...(args.targetSessionId?{targetSessionId:args.targetSessionId}:{}),...(args.query?{query:args.query}:{}),...(args.text?{text:args.text}:{})},signal:exec.signal});
+        return JSON.stringify(value);
       },
     }),
     defineTool({
@@ -119,9 +133,9 @@ export function createDirectorTools({ defineTool, fetchImpl=fetch, baseUrl='http
       async execute(args,exec) {
         if(!String(args.text||'').trim() || args.text.length>20000)throw new Error('补充内容需要 1–20000 个字符');
         await currentDirector(exec,args.requestId,args.taskId);
-        const result=await api(`/api/tasks/${encodeURIComponent(args.taskId)}/message`,{method:'POST',body:{text:args.text.trim()},signal:exec.signal});
+        const result=await api(`/api/tasks/${encodeURIComponent(args.taskId)}/message`,{method:'POST',body:{text:args.text.trim(),messageKey:`director-amend:${createHash('sha256').update(args.requestId+'\0'+args.taskId+'\0'+args.text).digest('hex')}`},signal:exec.signal});
         if(!result.ok)throw new Error('中枢没有接受补充内容');
-        return `补充已交给 ${args.taskId}。`;
+        return result.reply||'补充已记录，会在原工作会话安全接续。';
       },
     }),
   ];

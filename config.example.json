@@ -7,5 +7,8 @@
   "dshPrimaryUrl": "http://127.0.0.1:3080",
   "dshDirectorUrl": "http://127.0.0.1:3080",
   "codexCommand": "codex",
-  "libraryPythonCommand": "python"
+  "libraryPythonCommand": "python",
+  "localResources": {
+    "sampleIntervalMs": 60000
+  }
 }

@@ -44,6 +44,7 @@ export function createDshRouterAdapter({
   const fallback = fallbackBaseUrl ? adapterFactory({ ...fallbackOptions, baseUrl: fallbackBaseUrl }) : null;
   const director = directorBaseUrl ? adapterFactory({ ...directorOptions, baseUrl: directorBaseUrl }) : null;
   const routes = new Map();
+  const retainRoute=(task,route)=>{if(!route.hasTask||route.hasTask(task))routes.set(task.id,route);};
 
   function preferred(task) {
     if (task?.dshEndpoint === primaryBaseUrl) return primary;
@@ -76,7 +77,7 @@ export function createDshRouterAdapter({
       task.dshEndpoint = fallbackBaseUrl;
       const fallbackTask = { ...task, dshEndpoint: fallbackBaseUrl, sessionId: undefined };
       failoverPromise = Promise.resolve().then(() => second.start(fallbackTask, onEvent)).then((result) => {
-        routes.set(task.id, second);
+        retainRoute(task,second);
         return result;
       }).catch((error) => {
         onEvent({ type: 'failed', error: String(error?.message ?? error ?? 'DSH fallback failed').slice(0, 4000) });
@@ -98,7 +99,7 @@ export function createDshRouterAdapter({
       // A safe failure may arrive just before start() settles. In that case
       // observe() has already selected the fallback; do not overwrite that
       // route with the now-finished primary start call.
-      if (!failoverPromise) routes.set(task.id, first);
+      if (!failoverPromise) retainRoute(task,first);
       if (safeFailureBeforeStart) void startFallback();
       return result;
     } catch (error) {
@@ -115,7 +116,7 @@ export function createDshRouterAdapter({
       if (!second || !mayFailOver) throw error;
       task.dshEndpoint = fallbackBaseUrl;
       const result = await second.start({ ...task, dshEndpoint: fallbackBaseUrl, sessionId: undefined }, onEvent);
-      routes.set(task.id, second);
+      retainRoute(task,second);
       return result;
     }
   }
@@ -126,6 +127,9 @@ export function createDshRouterAdapter({
 
   return {
     start,
+    async steer(task,text) {
+      return routeFor(task).steer?.(task,text) ?? {accepted:false};
+    },
     async respond(task, approval, answer) {
       return routeFor(task).respond(task, approval, answer);
     },
@@ -135,6 +139,8 @@ export function createDshRouterAdapter({
     async reconcile(task) {
       return routeFor(task).reconcile?.(task) ?? false;
     },
+    release(task){const route=routeFor(task);if(route.release?.(task)!==true)return false;routes.delete(task.id);return true;},
+    diagnostics(){return {retainedTaskRoutes:routes.size,primary:primary.diagnostics?.()||null,fallback:fallback?.diagnostics?.()||null,director:director?.diagnostics?.()||null};},
     async close() {
       await Promise.allSettled([primary.close(), ...(fallback ? [fallback.close()] : []), ...(director && director !== fallback && director !== primary ? [director.close()] : [])]);
       routes.clear();
@@ -145,6 +151,11 @@ export function createDshRouterAdapter({
       return route===primary?primaryBaseUrl:route===director?directorBaseUrl:fallbackBaseUrl;
     },
     endpoints: { primary: primaryBaseUrl, fallback: fallbackBaseUrl, director: directorBaseUrl },
+    // The Hub uses this stable selection to decide whether a persistent
+    // director session crossed a provider/model boundary. A native session
+    // must not be reused across that boundary because its replayed reasoning
+    // blocks are provider-specific.
+    supervisorSelection: primaryOptions.supervisorSelection || null,
     directorEndpoint: directorBaseUrl || (directorToPrimary ? primaryBaseUrl : null),
     directorRoutePriority: directorToPrimary ? 'qq-simulation-primary-3080' : 'isolated-director-3180',
     directorPreset: directorToPrimary ? (primaryOptions.directorPreset || 'mornye-director') : (directorOptions.directorPreset || 'mornye-director'),

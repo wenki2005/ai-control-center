@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { redact } from './redact.mjs';
 
 const HEARTBEAT_GRACE_MS = 120000;
+const DSH_ALERT_GRACE_MS = 180000;
+const DSH_PENDING_ALERT = 'guardian:dsh:pending-alert';
 
 export class GuardianMonitor {
   constructor({runtime,store,notify=()=>{},onChange=()=>{},ensureGuardian=()=>{},now=()=>Date.now()}) {
@@ -47,7 +49,13 @@ export class GuardianMonitor {
         const message=redact(String(event.message || '服务状态变化')).slice(0,1500);
         this.store.event(null,'guardian.'+event.severity,{...event,message});
         if(event.severity==='warning')this.store.error(null,'看门狗：'+message);
-        this.store.enqueue((event.severity==='warning'?'助手中枢异常：':'助手中枢恢复：')+message,key);
+        if(event.service==='dsh') {
+          if(event.severity==='recovered') {
+            const raw=this.store.meta(DSH_PENDING_ALERT);let notified=false;try{notified=!!JSON.parse(raw||'null')?.notified;}catch{}
+            if(raw)this.store.event(null,notified?'guardian.alert-recovered':'guardian.alert-recovered-before-notification',{service:'dsh',eventId:event.id});
+            this.store.meta(DSH_PENDING_ALERT,'');
+          }else if(!this.store.meta(DSH_PENDING_ALERT))this.store.meta(DSH_PENDING_ALERT,JSON.stringify({key,firstSeen:this.now(),eventId:event.id}));
+        }else this.store.enqueue((event.severity==='warning'?'AI 中枢异常：':'AI 中枢恢复：')+message,key);
         this.store.meta(key,new Date(this.now()).toISOString());
       });
       ack.push(JSON.stringify({id:event.id,ackedAt:new Date(this.now()).toISOString()}));
@@ -56,6 +64,18 @@ export class GuardianMonitor {
     }}finally{reader?.close();stream?.destroy();}
     if(ack.length)appendFileSync(ackFile,ack.join('\n')+'\n');
     const state=this.state();
+    const pendingDsh=this.store.meta(DSH_PENDING_ALERT);
+    if(pendingDsh&&!state.stale){
+      let pending;try{pending=JSON.parse(pendingDsh);}catch{}
+      const dsh=state.services?.dsh;
+      if(pending&&dsh?.status==='healthy'&&(dsh.consecutiveFailures??0)===0){
+        this.store.event(null,pending.notified?'guardian.alert-recovered':'guardian.alert-recovered-before-notification',{service:'dsh',eventId:pending.eventId});
+        this.store.meta(DSH_PENDING_ALERT,'');
+      }else if(pending&&!pending.notified&&dsh?.status==='degraded'&&this.now()-pending.firstSeen>=DSH_ALERT_GRACE_MS){
+        this.store.enqueue('DSH 连接探测连续异常已超过3分钟，中枢正在保留原工作并继续检查；这项探测尚不能判断模型任务是否失败。',pending.key);
+        this.store.meta(DSH_PENDING_ALERT,JSON.stringify({...pending,notified:true}));
+      }
+    }
     if(this.now()-this.startedAt>90000) {
       const now=this.now();
       const previous=this.store.meta('guardian:heartbeat') || 'healthy';

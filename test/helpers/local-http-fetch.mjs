@@ -1,0 +1,3 @@
+import {request} from 'node:http';import {Readable} from 'node:stream';
+// Keep streaming semantics for SSE while testing OS-assigned loopback ports.
+export function localHttpFetch(url,options={}){const target=new URL(url);if(target.protocol!=='http:'||target.hostname!=='127.0.0.1')throw Error('Test helper accepts loopback HTTP only');return new Promise((resolve,reject)=>{const req=request(target,{method:options.method||'GET',headers:options.headers,signal:options.signal},res=>{const body=[204,205,304].includes(res.statusCode)?null:Readable.toWeb(res);resolve(new Response(body,{status:res.statusCode,headers:res.headers}));});req.on('error',reject);if(options.body)req.write(options.body);req.end();});}

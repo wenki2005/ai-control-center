@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { join, isAbsolute } from 'node:path';
 
 /** Resolve a worker's project, reusable session, and DSH continuation evidence. */
 export function resolveWorkerContext({
@@ -15,8 +15,10 @@ export function resolveWorkerContext({
   }
   let continuedFrom=null,coordinatorSessionFallback=null;
   if(role==='worker' && nativeSession) {
-    if(engine!=='dsh' || !['director','coordinator'].includes(parent?.role) || !/^session-[\w-]+$/u.test(String(nativeSession.sessionId||'')) || typeof nativeSession.cwd!=='string' || !nativeSession.cwd.trim())throw Error('主管原生会话必须由中枢校验后绑定到 DSH worker');
-    if(store.db.prepare("SELECT 1 FROM tasks WHERE sessionId=? AND status IN ('queued','running','waiting') LIMIT 1").get(nativeSession.sessionId))throw Error('指定 DSH 会话已有中枢任务正在执行');
+    const nativeEngine=nativeSession.engine||'dsh';
+    const validId=engine==='dsh'?/^session-[\w-]+$/u:/^[\w-]{1,180}$/u;
+    if(engine!==nativeEngine || !['director','coordinator'].includes(parent?.role) || !validId.test(String(nativeSession.sessionId||'')) || typeof nativeSession.cwd!=='string' || !isAbsolute(nativeSession.cwd))throw Error('主管原生会话必须由中枢核验引擎、原会话和工作目录后绑定');
+    if(store.db.prepare("SELECT 1 FROM tasks WHERE engine=? AND sessionId=? AND status IN ('queued','running','waiting') LIMIT 1").get(engine,nativeSession.sessionId))throw Error('指定会话已有中枢任务正在执行');
     requestedSessionId=nativeSession.sessionId;
     cwd=nativeSession.cwd;
   }

@@ -1,4 +1,6 @@
 import { resolveDispatchEngine } from '../routing/engine-policy.mjs';
+import { buildWorkHandoff } from '../hub/work-handoff.mjs';
+import { amendmentIdempotencyKey } from '../hub/task-amendments.mjs';
 
 const isExplicitTest=title=>/(测试|验收|回归|联调|自动测试|连接测试|\btest\b|runtime\s*check)/iu.test(String(title||''));
 const isLegacyDispatchAutomation=title=>/^中枢派发 ·/u.test(String(title||''));
@@ -31,6 +33,11 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
     const fixedSessionIds=new Set(['directorSessionId','coordinatorSessionId','directSessionId','reportDirectorSessionId'].map(key=>store.meta(key)).filter(Boolean));
     for(const engine of ['dsh','codex','workbuddy']){try{const remembered=JSON.parse(store.meta(`worker:fixed:${engine}`)||'null');if(remembered?.sessionId)fixedSessionIds.add(remembered.sessionId);}catch{}}
     for(const row of store.db.prepare("SELECT value FROM metadata WHERE lower(key) LIKE '%session%'").all()){if(/^session-[\w-]+$/u.test(row.value||''))fixedSessionIds.add(row.value);}
+    // Specialist bindings live in their own table, not the metadata keys.
+    // Archiving one silently blocks all later catalog/maintenance work in DSH.
+    if(store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='specialist_agents'").get()) {
+      for(const row of store.db.prepare('SELECT sessionId FROM specialist_agents WHERE sessionId IS NOT NULL').all())fixedSessionIds.add(row.sessionId);
+    }
     const pendingApprovalTaskIds=new Set(store.db.prepare("SELECT DISTINCT taskId FROM approvals WHERE status IN ('pending','resolving')").all().map(row=>row.taskId));
     const archivedIds=new Set(store.db.prepare("SELECT sessionId FROM dsh_archived_sessions").all().map(row=>row.sessionId));
     return {taskRows,fixedSessionIds,pendingApprovalTaskIds,archivedIds};
@@ -59,20 +66,22 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
         safeData={status:safeText(data.status,100)};break;
       case 'task.milestone':
         safeData={summary:safeText(data.summary,600)};break;
+      case 'task.dispatch-hint':
+        safeData={text:safeText(data.text,600),hint:true};break;
       default:return null;
     }
     return {type:row.type,createdAt:row.createdAt,data:safeData};
   }
   function publicEvents(rows) {
-    const visible=[];
+    const visible=[];let previousStream=null;
     for(const row of rows) {
       const event=publicEvent(row);
       if(!event)continue;
-      // Engine adapters emit cumulative snapshots while a single assistant
-      // turn streams. Keep the latest snapshot in each contiguous run so the
-      // live monitor updates one bubble instead of replaying every prefix.
-      if(event.type==='message' && visible.at(-1)?.type==='message')visible[visible.length-1]=event;
+      let identity=null;
+      if(row.type==='message')try{const data=JSON.parse(row.data),s=data.stream;if(s?.kind==='snapshot'&&s.requestId&&s.sessionId&&Number.isSafeInteger(s.runVersion)&&!data.progress&&!data.usage)identity=JSON.stringify([s.sessionId,s.requestId,s.runVersion]);}catch{}
+      if(identity&&identity===previousStream&&visible.at(-1)?.type==='message')visible[visible.length-1]=event;
       else visible.push(event);
+      previousStream=identity;
     }
     return visible;
   }
@@ -137,6 +146,16 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
       }
       return json(res,200,{task}),true;
     }
+    if(path==='/api/director/amend-task' && req.method==='POST') {
+      const {sessionId,targetTaskId,text}=await body(req);
+      if(typeof sessionId!=='string'||typeof targetTaskId!=='string')return json(res,400,{error:'原会话或任务引用无效'}),true;
+      const caller=store.db.prepare("SELECT * FROM tasks WHERE engine='dsh' AND role='director' AND sessionId=? AND status='running' ORDER BY createdAt DESC LIMIT 1").get(sessionId);
+      if(!caller)return json(res,403,{error:'当前主管请求已结束，请勿从旧会话重复操作'}),true;
+      const target=store.task(targetTaskId);if(!target||target.role!=='worker')return json(res,404,{error:'找不到原工作任务'}),true;
+      const result=await hub.message(target.id,text,{messageKey:`native-amend:${amendmentIdempotencyKey(caller.id+':'+target.id,String(text))}`,source:'supervisor'});
+      store.event(caller.id,'director.amended',{workerId:target.id});
+      json(res,200,result);return true;
+    }
     if(path==='/api/director/native-context' && req.method==='POST') {
       const {sessionId}=await body(req);
       if(typeof sessionId!=='string'||!/^session-[\w-]+$/u.test(sessionId))return json(res,400,{error:'主管会话身份无效'}),true;
@@ -170,7 +189,7 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
       if(caller.role==='director' && String(caller.prompt||'').startsWith('[前台回应]'))return json(res,403,{error:'前台回应不能创建执行任务，请用主管派单工具处理新的明确指令。'}),true;
       const already=linkedDispatch(caller);
       if(already)return json(res,200,{accepted:true,task:{id:already.id,engine:already.engine,sessionTitle:hub.sessionTitleForTask(already),role:already.role}}),true;
-      const engine=resolveDispatchEngine({parentPrompt:caller.prompt,proposedEngine:'dsh'});
+      const engine=resolveDispatchEngine({parentPrompt:hub.workHandoff(caller)?.userRequest||caller.prompt,proposedEngine:'dsh',selectedEngine:hub.workHandoff(caller)?.executionEngine||hub.workerEngine()});
       let sessionHint='',target=null;
       if(engine==='dsh') {
       if(!nativeTasks)return json(res,503,{error:'DSH 会话列表暂不可用'}),true;
@@ -188,14 +207,17 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
       return json(res,200,{accepted:true,task:{id:coordinator.id,engine:coordinator.engine,sessionTitle:hub.sessionTitleForTask(coordinator),role:'coordinator'}}),true;
     }
     if(path==='/api/director/delegate' && req.method==='POST') {
-      const {requestId,sessionId,engine,prompt,project,dispatchKey}=await body(req);
+      const {requestId,sessionId,engine,prompt,project,dispatchKey,contextTaskId}=await body(req);
+      if(contextTaskId!==undefined&&(typeof contextTaskId!=='string'||contextTaskId.length>80))return json(res,400,{error:'前次任务引用无效'}),true;
       if(typeof requestId!=='string'||typeof sessionId!=='string'||!/^session-[\w-]+$/u.test(sessionId)||!['dsh','codex','workbuddy'].includes(engine)||typeof prompt!=='string'||!prompt.trim()||prompt.length>20000||typeof dispatchKey!=='string'||!/^[a-f0-9]{24}$/u.test(dispatchKey)||(project!==undefined&&(typeof project!=='string'||project.length>100)))return json(res,400,{error:'主管派单请求无效'}),true;
       const caller=store.task(requestId);
       if(!caller||caller.role!=='director'||caller.engine!=='dsh'||caller.status!=='running'||caller.sessionId!==sessionId)return json(res,403,{error:'本轮主管请求已结束或会话不匹配，请不要重复派单。'}),true;
       const already=linkedDispatch(caller);
       if(already)return json(res,200,{accepted:true,task:{id:already.id,engine:already.engine,sessionTitle:hub.sessionTitleForTask(already),role:already.role}}),true;
       const key=`director:${caller.id}:${dispatchKey}`;
-      const coordinator=await hub.create({engine:'dsh',role:'coordinator',prompt:`[二级协调]\n一级主管判断需要执行，并建议引擎：${engine}。${project?`\n项目建议：${project}`:''}\n执行目标：${prompt.trim()}\n用户原话：${caller.prompt}`,messageKey:key});
+      const handoff=buildWorkHandoff({store,userText:caller.prompt,goal:prompt.trim(),...(contextTaskId?{sourceTaskId:contextTaskId}:{})});
+      const effectiveEngine=hub.directorRequestedEngine(caller)||engine;
+      const coordinator=await hub.create({engine:'dsh',role:'coordinator',prompt:`[二级协调]\n执行引擎：${effectiveEngine}。${project?`\n项目建议：${project}`:''}\n执行目标：${prompt.trim()}\n用户原话：${caller.prompt}`,messageKey:key,handoff:{...hub.workHandoff(caller),...handoff,preferredEngine:effectiveEngine}});
       return json(res,200,{accepted:true,task:{id:coordinator.id,engine:coordinator.engine,sessionTitle:hub.sessionTitleForTask(coordinator),role:'coordinator'}}),true;
     }
     const session=/^\/api\/tasks\/([^/]+)\/session$/.exec(path);
@@ -238,7 +260,8 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
     const action=/^\/api\/tasks\/([^/]+)\/(message|cancel)$/.exec(path);
     if(action && req.method==='POST') {
       const value=await body(req);
-      json(res,200,action[2]==='message'?await hub.message(action[1],value.text):await hub.cancel(action[1],{source:'control-panel'}));return true;
+      if(action[2]==='cancel'&&value.confirmed!==true){json(res,409,{error:'停止任务需要单独确认',confirmationRequired:true});return true;}
+      json(res,200,action[2]==='message'?await hub.message(action[1],value.text,{messageKey:value.messageKey}):await hub.cancel(action[1],{source:'control-panel'}));return true;
     }
     return false;
   };

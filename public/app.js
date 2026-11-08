@@ -1,6 +1,34 @@
 (() => {
   'use strict';
 
+  // All public pages use this one identity/theme projection. Application names
+  // remain stable; persona names and portraits follow the active card.
+  const identity = (() => {
+    let persona={},lastRefresh=0,inflight=null;
+    const avatarFile=(value={})=>/^[a-zA-Z0-9_-]+\.(?:png|webp|jpe?g)$/i.test(String(value.avatar||''))?value.avatar:({'AI 助手':'default-avatar.png','AI 助手':'default-avatar.png','AI 助手':'default-avatar.png'}[value.name]||'default-avatar.png');
+    const avatarUrl=value=>{const file=avatarFile(value);return file==='default-avatar.png'?'/default-avatar.png':`/persona-avatars/${encodeURIComponent(file)}`;};
+    function apply(value={}){
+      persona=value;
+      const color=/^#[0-9a-f]{6}$/i.test(value.themeColor||'')?value.themeColor:'#5d79b2',style=document.documentElement.style;
+      for(const key of ['--blue','--blue-deep','--persona-color','--rc-accent'])style.setProperty(key,color);
+      for(const [key,mix]of [['--blue-wash',`${color} 10%, white`],['--paper',`${color} 3%, #f7f8fb`],['--line',`${color} 12%, #eef1f6`],['--persona-glow',`${color} 9%, white`]])style.setProperty(key,`color-mix(in srgb, ${mix})`);
+      const page=document.body.dataset.appPage||'';document.title=page?`${page} · AI 中枢`:'AI 中枢';
+      let icon=document.querySelector('link[rel="icon"]');if(!icon){icon=document.createElement('link');icon.rel='icon';document.head.append(icon);}icon.href=avatarUrl(value);
+      document.querySelector('meta[name="theme-color"]')?.setAttribute('content',color);
+      for(const label of document.querySelectorAll('[data-persona-name]'))label.textContent=value.name||'当前助手';
+      for(const image of document.querySelectorAll('[data-persona-avatar]')){image.src=avatarUrl(value);image.alt=value.name||'当前人设';}
+      document.dispatchEvent(new CustomEvent('ai-center-identity',{detail:value}));
+    }
+    async function refresh(){
+      if(Date.now()-lastRefresh<15000)return persona;
+      if(inflight)return inflight;
+      inflight=(async()=>{const r=await fetch('/api/companion?view=appearance',{credentials:'same-origin',signal:AbortSignal.timeout(8000)});if(!r.ok)throw Error('读取当前人设失败');const data=await r.json();if(data.persona){apply(data.persona);lastRefresh=Date.now();}return persona;})().finally(()=>{inflight=null;});return inflight;
+    }
+    return {applicationName:'AI 中枢',apply,refresh,avatarFile,avatarUrl,get persona(){return persona;},get name(){return persona.name||'当前助手';}};
+  })();
+  window.aiCenterIdentity=identity;
+  if(!document.querySelector('#chat-form')){void identity.refresh().catch(()=>{});return;}
+
   try { history.scrollRestoration = 'manual'; } catch { /* The embedded view may lock scroll restoration. */ }
   const resetDocumentScroll = () => window.scrollTo(0, 0);
   resetDocumentScroll();
@@ -25,8 +53,10 @@
   const computer = { actions: [], loading: false };
   let toastTimer;
   let showAllTasks = false;
+  let taskHistoryPage=[],taskHistoryCursor=null,taskHistoryStarted=false;
   let activeSearch = '';
   let searchResults = [];
+  let archiveResultCount = 0;
   let selectedTaskId = '';
   let taskMonitor = { task: null, events: [], loading: false };
   let taskEventRequest = 0;
@@ -86,7 +116,10 @@
     const list=$('#session-cleanup-list'),confirm=$('#session-cleanup-confirm');
     confirm.disabled=true;list.replaceChildren(make('div','empty-state','正在读取旧自动会话…'));
     try {
-      const data=await api('/api/dsh/sessions/cleanup');list.replaceChildren();
+      const [data,retention]=await Promise.all([api('/api/dsh/sessions/cleanup'),api('/api/dsh/sessions/retention/settings').catch(()=>null)]);list.replaceChildren();
+      $('#session-retention-enabled').disabled=!retention;
+      if(retention){$('#session-retention-enabled').checked=retention.enabled;$('#session-retention-status').textContent=`${retention.enabled?'已启用':'已暂停'}：每小时检查系统创建超过3天或闲置超过15天的会话；先备份、整理记忆候选，再归档。个人、固定、正在工作及归属不明的会话保留。累计归档${retention.archivedCount||0}个。`;}
+      else $('#session-retention-status').textContent='自动归档规则已准备，等待当前任务结束后安全加载；原有会话整理仍可使用。';
       const sessions=Array.isArray(data?.sessions)?data.sessions:[];
       if(!sessions.length){list.append(make('div','empty-state','没有发现标题明确标记为测试的会话。'));return;}
       for(const session of sessions) {
@@ -170,13 +203,14 @@
     const labels = { calm: '平静', focused: '专注', happy: '开心', concerned: '担心', urgent: '有点急', relieved: '放心了', frustrated: '有点懊恼', sad: '低落', curious: '好奇', playful: '俏皮', affectionate: '亲近', wistful: '怀念' };
     const mood = labels[emotion.mood] || '平静';
     target.className = `companion-mood mood-${emotion.mood || 'calm'}`;
-    target.textContent = `${companion.data.persona?.name || '助手'} · ${mood}`;
+    target.textContent = `${companion.data.persona?.name || '当前助手'} · ${mood}`;
     target.title = emotion.reason || '';
   }
   function taskEventText(event) {
     const data = event?.data || {};
     if (event?.type === 'message') return String(data.text || '').trim();
     if (event?.type === 'narrator.completed' || event?.type === 'narrator.fallback') return String(data.text || '').trim();
+    if (event?.type === 'task.dispatch-hint') return '派发提示：'+String(data.text || '').trim();
     if (event?.type === 'approval.created' || event?.type === 'approval') return `需要选择：${data.question || '请确认下一步'}`;
     if (event?.type === 'failed') return `执行失败：${data.error || '未知错误'}`;
     if (event?.type === 'completed') return String(data.text || '任务已完成。').trim();
@@ -320,7 +354,7 @@
     const list = $('#task-list');
     list.replaceChildren();
     const tasks = [...state.tasks].sort((a, b) => (asDate(b.updatedAt)?.getTime() || 0) - (asDate(a.updatedAt)?.getTime() || 0));
-    $('#task-count').textContent = `${tasks.length} 项`;
+    $('#task-count').textContent = Number.isInteger(state.taskCount)?`${state.taskCount} 项记录 · 当前载入 ${tasks.length} 项`:`${tasks.length} 项`;
     if (!tasks.length) { list.append(make('div', 'empty-state', '还没有任务。')); return; }
     const visibleTasks = showAllTasks ? tasks : tasks.slice(0, 10);
     for (const task of visibleTasks) {
@@ -358,12 +392,12 @@
         actions.append(dshButton);
       }
       if (active(task)) {
-        const cancel = make('button', 'text-action danger', '取消任务'); cancel.type = 'button'; cancel.addEventListener('click', () => cancelTask(task, cancel)); actions.append(cancel);
+        const cancel = make('button', 'text-action danger', '强制停止'); cancel.type = 'button'; cancel.addEventListener('click', () => cancelTask(task, cancel)); actions.append(cancel);
       }
-      if (!active(task) && task.canContinue) {
+      if (task.canAmend || (!active(task) && task.canContinue)) {
         const follow = make('form', 'followup');
-        const input = document.createElement('input'); input.type = 'text'; input.maxLength = 12000; input.placeholder = task.status === 'interrupted' ? '在原会话继续…' : '继续这个任务…'; input.setAttribute('aria-label', '给这个任务发送后续消息');
-        const button = make('button', '', '发送'); button.type = 'submit'; follow.append(input, button);
+        const input = document.createElement('input'); input.type = 'text'; input.maxLength = 12000; input.placeholder = active(task) ? '补充要求，本轮安全结束后续接…' : task.status === 'interrupted' ? '在原会话继续…' : '继续这个任务…'; input.setAttribute('aria-label', '给这个任务发送后续消息');
+        const button = make('button', '', active(task)?'记录补充':'发送'); button.type = 'submit'; follow.append(input, button);
         follow.addEventListener('submit', event => { event.preventDefault(); sendFollowup(task, input.value.trim(), button, input); });
         actions.append(follow);
       }
@@ -378,15 +412,20 @@
   }
   async function cancelTask(task, button) {
     const sessionName = task.sessionTitle || '中枢任务会话';
-    if (!window.confirm(`确定停止会话“${sessionName}”中的任务吗？这会取消该会话的后续处理。`)) return;
+    if (!window.confirm(`确定立即停止“${sessionName}”中的这个任务吗？这会中断执行并禁止后续自动接续；已经发生的操作不会自动撤销。`)) return;
     button.disabled = true;
-    try { await api(`/api/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST', body: '{}' }); toast('已请求取消'); await loadState(); }
+    try { const result=await api(`/api/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST', body: json({confirmed:true}) }); toast(result.ok?'执行端已确认停止':'停止尚未确认，请查看任务状态'); await loadState(); }
     catch (error) { toast(`取消失败：${error.message}`); button.disabled = false; }
   }
   async function sendFollowup(task, text, button, input) {
     if (!text) return;
     button.disabled = true;
-    try { await api(`/api/tasks/${encodeURIComponent(task.id)}/message`, { method: 'POST', body: json({ text }) }); input.value = ''; toast('已发回原任务会话'); await loadState(); }
+    try {
+      if(input.dataset.amendmentText!==text){input.dataset.amendmentText=text;input.dataset.amendmentKey=crypto.randomUUID();}
+      const result=await api(`/api/tasks/${encodeURIComponent(task.id)}/message`, { method: 'POST', body: json({ text,messageKey:input.dataset.amendmentKey }) });
+      input.value = '';delete input.dataset.amendmentText;delete input.dataset.amendmentKey;
+      toast(result.reply||'已发回原任务会话'); await loadState();
+    }
     catch (error) { toast(`发送失败：${error.message}`); }
     finally { button.disabled = false; }
   }
@@ -614,8 +653,7 @@
   }
   function render() {
     renderHealth(); renderCompanionEmotion(); renderDirectSession(); renderChat(); renderApprovals(); renderTasks(); renderErrors(); renderSpecialists();
-    if (activeSearch) renderArtifacts(searchResults, searchResults.length, 'search');
-    else renderArtifacts(state.artifacts.slice(0, 10), state.artifacts.length, 'recent');
+    renderArtifacts(searchResults, archiveResultCount, activeSearch ? 'search' : 'recent');
     setConnection(true, '已连接');
   }
   function renderSpecialists(){
@@ -646,33 +684,35 @@
   function personaValue(value) {
     return Array.isArray(value) ? value.join('\n') : (value ?? '');
   }
+  function personaAvatarFile(persona = {}) {
+    return identity.avatarFile(persona);
+  }
+  let appliedAppAvatar='',appAvatarFlight=Promise.resolve();
   function makePersonaAvatar(persona = {}, decorative = false) {
-    const stored=String(persona.avatar||'');
-    const avatar=/^[a-zA-Z0-9_-]+\.(?:png|webp|jpe?g)$/i.test(stored)
-      ? stored
-      : (String(persona.name||'')==='AI 助手'?'default-avatar.png':'default-avatar.png');
+    const avatar=personaAvatarFile(persona);
     if(/^[a-zA-Z0-9_-]+\.(?:png|webp|jpe?g)$/i.test(avatar)) {
-      const avatarClass='persona-avatar-default';
-      const image=document.createElement('img');image.className=`persona-avatar-image ${avatarClass}`;image.src=avatar==='default-avatar.png'?`/${encodeURIComponent(avatar)}`:`/persona-avatars/${encodeURIComponent(avatar)}`;
+      const avatarClass=avatar==='default-avatar.png'?'persona-avatar-entelechia':avatar==='default-avatar.png'?'persona-avatar-aemeath':avatar==='default-avatar.png'?'persona-avatar-dania':'persona-avatar-mornye';
+      const image=document.createElement('img');image.className=`persona-avatar-image ${avatarClass}`;image.src=identity.avatarUrl(persona);
       image.alt=decorative?'':String(persona.name||'人设头像');image.onerror=()=>{image.replaceWith(make('span','persona-avatar-fallback','✦'));};return image;
     }
     return make('span','persona-avatar-fallback',avatar);
   }
   function applyPersonaAppearance(persona = {}) {
-    const color = /^#[0-9a-f]{6}$/i.test(persona.themeColor || '') ? persona.themeColor : '#5d79b2';
-    document.documentElement.style.setProperty('--blue', color);
-    document.documentElement.style.setProperty('--blue-deep', color);
-    document.documentElement.style.setProperty('--persona-color', color);
-    const name = String(persona.name || '助手');
+    identity.apply(persona);
+    const name = String(persona.name || '当前助手');
     $('#active-persona-name').textContent = name;
     $('#active-persona-avatar').replaceChildren(makePersonaAvatar(persona));
     $('#conversation-persona-title').textContent = `和${name}说`;
+    $('#chat-input').placeholder = persona.address ? `${persona.address}，想聊什么？` : '想聊些什么？';
     $('#persona-page-title').textContent = `${name}的人设卡与共用记忆`;
     $('#memory-heading').textContent = `${name}的共用记忆`;
     const memoryInput=$('#memory-new-text');if(memoryInput)memoryInput.placeholder=`添加所有人设共用的记忆…`;
-    document.title = `${name} · AI 中控`;
+    const avatarFile=personaAvatarFile(persona);
+    if(window.aiCenterAppearance && appliedAppAvatar!==avatarFile){
+      appliedAppAvatar=avatarFile;
+      appAvatarFlight=appAvatarFlight.catch(()=>{}).then(()=>window.aiCenterAppearance.setAvatar(avatarFile)).catch(()=>{if(appliedAppAvatar===avatarFile)appliedAppAvatar='';});
+    }
     document.querySelector('.conversation')?.setAttribute('aria-label',`和${name}对话`);
-    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', color);
   }
   function setPersonaForm(persona = {}) {
     $('#persona-address').value = persona.address ?? '';
@@ -680,12 +720,65 @@
     const storedAvatar=String(persona.avatar||'');
     $('#persona-avatar').value=/^[a-zA-Z0-9_-]+\.(?:png|webp|jpe?g)$/i.test(storedAvatar)?storedAvatar:(String(persona.name||'')==='AI 助手'?'default-avatar.png':'default-avatar.png');
     $('#persona-theme-color').value = persona.themeColor || '#5d79b2';
+    $('#persona-qq-nickname').value = persona.qqNickname ?? '';
+    $('#persona-voice-profile').value = persona.voiceProfileId ?? '';
     $('#persona-style').value = persona.style ?? '';
+    $('#persona-report-style').value = persona.reportStyle ?? '';
+    $('#persona-report-examples').value = (persona.reportExamples || []).join('\n\n');
     $('#persona-background').value = persona.background ?? '';
-    $('#persona-examples').value = personaValue(persona.examples);
+    $('#persona-examples').value = Array.isArray(persona.examples) ? persona.examples.join('\n\n') : personaValue(persona.examples);
     $('#persona-form').dataset.dirty = 'false';
     applyPersonaAppearance(persona);
+    void loadPersonaVoiceProfiles();
   }
+  async function loadPersonaVoiceProfiles() {
+    try {
+      const data = await api('/api/voice');
+      const select = $('#persona-voice-profile');
+      const current = String(companion.data.persona?.voiceProfileId ?? '');
+      select.replaceChildren(new Option('默认音色（不联动）', ''));
+      for (const profile of Array.isArray(data.profiles) ? data.profiles : []) select.append(new Option(String(profile.label ?? profile.id ?? '未命名音色'), String(profile.id ?? '')));
+      select.value = current;
+    } catch {}
+  }
+  function renderPersonaIdentity(data = {}) {
+    const checkbox = $('#persona-qq-sync'), status = $('#persona-identity-status');
+    if (!checkbox || !status) return;
+    checkbox.checked = Boolean(data.enabled);
+    const label = (item, success, pending) => {
+      const value = typeof item === 'string' ? item : String(item?.status || 'unknown').toLowerCase();
+      if (value === 'confirmed') return success;
+      if (value === 'failed') return `${pending}失败${item?.error ? `：${item.error}` : ''}`;
+      if (value === 'syncing') return `${pending}处理中…`;
+      if (value === 'disabled') return `${pending}未启用`;
+      if (value === 'skipped') return pending === '音色' ? '音色保持手动选择' : `${pending}未设置`;
+      return `${pending}需核对`;
+    };
+    const top = String(data.status || '').toLowerCase();
+    if (top === 'disabled' || !data.enabled) { status.textContent = '未启用 QQ 同步'; return; }
+    const lines = [
+      label(data.nickname, 'QQ 昵称已核验', 'QQ 昵称'),
+      label(data.avatar, '头像设置已确认（以 QQ 显示为准）', 'QQ 头像'),
+      label(data.voice, '音色已切换', '音色'),
+    ];
+    if (top === 'syncing') lines.unshift('QQ 同步中…');
+    else if (top === 'partial') lines.unshift('部分完成');
+    else if (top === 'unknown') lines.unshift('同步状态需核对');
+    if (data.error) lines.push(`详情：${data.error}`);
+    status.textContent = lines.join('\n');
+  }
+  async function loadPersonaIdentity() {
+    try { renderPersonaIdentity(await api('/api/companion/identity')); }
+    catch (error) { $('#persona-identity-status').textContent = `读取失败：${error.message}`; }
+  }
+  $('#persona-qq-sync')?.addEventListener('change', async event => {
+    const checkbox = event.currentTarget;
+    checkbox.disabled = true;
+    $('#persona-identity-status').textContent = checkbox.checked ? '正在请求 QQ 同步…' : '正在关闭 QQ 同步…';
+    try { renderPersonaIdentity(await api('/api/companion/identity', { method: 'POST', body: json({ enabled: checkbox.checked }) })); }
+    catch (error) { checkbox.checked = !checkbox.checked; $('#persona-identity-status').textContent = `更新失败：${error.message}`; }
+    finally { checkbox.disabled = false; }
+  });
   function renderPersonaProfiles() {
     const select = $('#persona-profile-select');
     if (!select) return;
@@ -768,15 +861,21 @@
     const status = $('#proactive-status');
     if (!toggle || !status) return;
     toggle.checked = settings.enabled !== false;
-    const activeName=companion.data.persona?.name||'助手';
+    const phoneToggle = $('#phone-autonomy-enabled');
+    if (phoneToggle) phoneToggle.checked = settings.phoneAutonomyEnabled === true;
+    const activeName=companion.data.persona?.name||'当前助手';
     const labels = {
       waiting: '等你安静一段时间后再考虑。',
       considering: `${activeName}正在判断有没有自然的话题。`,
+      phone_exploring: `${activeName}正在手机上看看有趣的内容。`,
       sent: '最近已经联系过，会留出一些间隔。',
       no_message: '暂时没有合适的话题，所以没有发消息。',
       quiet_hours: '现在是安静时段，之后再考虑。',
       cooldown: '还在两次联系之间的间隔里。',
-      busy: '有任务正在处理，暂时不打扰。',
+      busy: '正在处理当前对话，稍后再接着聊；后台工作不会挡住闲聊。',
+      queued: '想说的话已进入 QQ 队列；你接话后会停下旧补充。',
+      delivery_pending: '上一组消息还在发送，先等它送达。',
+      delivery_uncertain: '上一组发送结果待核对，暂不追加以免重复。',
       offline: 'QQ 或 DSH 暂不可用，连接恢复后再考虑。',
       direct_mode: '当前正在直连会话，暂不发起闲聊。',
       retry_later: '刚才没有完成这次判断，稍后会再试。',
@@ -793,7 +892,7 @@
     morning.checked = settings.morningEnabled !== false;
     time.value = settings.morningTime || '08:30';
     breaking.checked = settings.breakingEnabled !== false;
-    const activeName=companion.data.persona?.name||'助手';
+    const activeName=companion.data.persona?.name||'当前助手';
     const labels = {
       waiting: '晨报按设定时间送达；重要消息约每两小时筛查一次。',
       morning_research: `${activeName}正在整理今天的晨报。`,
@@ -815,6 +914,7 @@
     status.textContent = `${labels[settings.status] || '新闻分享已开启。'}${settings.breakingEnabled !== false ? ` 今日重要提醒 ${alerts}/${settings.maxAlertsPerDay || 2}。` : ''}`;
   }
   function renderDiary(data = {}) {
+    if (data.dailyReview) renderDailyReview(data.dailyReview);
     const settings = data.settings || {};
     const toggle = $('#diary-enabled');
     if (toggle) toggle.checked = settings.enabled !== false;
@@ -835,6 +935,42 @@
     try { renderDiary(await api('/api/companion/diary?limit=30')); }
     catch (error) { const status = $('#diary-status'); if (status) status.textContent = `日记读取失败：${error.message}`; }
   }
+  function renderDailyReview(data = {}) {
+    const toggle = $('#daily-review-enabled'); if (toggle) toggle.checked = data.enabled !== false;
+    const status = $('#daily-review-status');
+    const delivery = {sent:'QQ 已发送',pending:'等待 QQ 发送',sending:'QQ 发送中',uncertain:'发送结果待核对，不自动重发'}[data.delivery?.status] || '尚未推送';
+    if (status) status.textContent = `每天 23:00（上海） · ${data.running ? '正在自动整理' : data.last?.error ? '整理失败，稍后自动重试' : delivery}${data.last ? ` · ${data.last.day}` : ''}`;
+    const preview = $('#daily-review-preview'); if (preview) preview.textContent = data.last?.summary || '';
+  }
+  function renderCognition(data={}) {
+    const s=data.settings||data;
+    const labels={score:'评估记忆重要性',questions:'形成反思问题',reflect:'生成有依据的反思',plan:'整理与调整交流计划',completed:'本轮已完成'};
+    const status=$('#cognition-status');if(status)status.textContent=`${s.enabled?'已开启':'已暂停'} · 重要性积累 ${s.accumulatedImportance||0}/${s.reflectionThreshold||150} · ${labels[s.lastCycle?.phase]||'等待新交流'}${s.lastCycle?.error?' · 暂未完成，保留进度后重试':''}`;
+    const panel=$('#cognition-panel');if(!panel?.contains(document.activeElement)) {
+      const enabled=$('#cognition-enabled');if(enabled)enabled.checked=s.enabled!==false;
+      for(const k of ['recency','relevance','importance']){const input=$('#cognition-'+k);if(input)input.value=String(s.weights?.[k]??1);}
+      const threshold=$('#cognition-threshold');if(threshold)threshold.value=String(s.reflectionThreshold||150);
+    }
+    if(Array.isArray(data.reflections)) {
+      const box=$('#cognition-reflections');if(box){box.replaceChildren(make('h4','','有依据的反思'));
+        if(!data.reflections.length)box.append(make('p','','尚未积累出可支持的反思。'));
+        for(const r of data.reflections.slice(0,6)){const item=make('article','diary-entry');item.append(make('p','',r.text),make('small','',`推断 · ${r.evidence.length}条有效来源 · ${r.personaId?'当前人设':'共用'} · ${String(r.createdAt).slice(0,10)}`));box.append(item);}}
+    }
+    const box=$('#cognition-plans');if(box){box.replaceChildren(make('h4','','当前交流计划'));
+      for(const p of s.plans||[]){const card=make('article','diary-entry');card.append(make('p','',p.goal),make('small','',p.needsReplan?'新交流或来源变化后，等待重新规划':'计划可随当前交流调整'));
+        for(const step of p.steps||[])card.append(make('p','',`${step.status==='offered'?'已提过':step.status==='waited'?'已选择等待':'待考虑'} · ${step.text}`));box.append(card);}
+      if(!s.plans?.length)box.append(make('p','','等待形成有依据的计划。'));
+    }
+  }
+  async function loadCognition(){try{renderCognition(await api('/api/companion/cognition'));}catch(error){const status=$('#cognition-status');if(status)status.textContent=`读取失败：${error.message}`;}}
+  $('#cognition-panel')?.addEventListener('toggle',()=>{if($('#cognition-panel').open)void loadCognition();});
+  $('#cognition-save')?.addEventListener('click',async()=>{try{const weights={};for(const k of ['recency','relevance','importance'])weights[k]=Number($('#cognition-'+k).value);
+    renderCognition(await api('/api/companion/cognition',{method:'POST',body:json({enabled:$('#cognition-enabled').checked,weights,reflectionThreshold:Number($('#cognition-threshold').value)})}));toast('记忆评分与反思设置已保存');}catch(error){toast(error.message);}});
+  $('#daily-review-enabled')?.addEventListener('change', async event => {
+    const enabled = event.target.checked;
+    try { renderDailyReview(await api('/api/companion/daily-review', {method:'POST',body:json({enabled})})); }
+    catch (error) { event.target.checked = !enabled; toast(`更新每日总结失败：${error.message}`); }
+  });
   async function loadCompanion({ preserveDrafts = false } = {}) {
     if (companion.loading) return;
     companion.loading = true;
@@ -849,6 +985,8 @@
       const data = await api('/api/companion');
       companion.data = { persona: data?.persona || {}, personaProfiles: Array.isArray(data?.personaProfiles) ? data.personaProfiles : [], activePersonaId: data?.activePersonaId || 'mornye', memories: Array.isArray(data?.memories) ? data.memories : [], facts: Array.isArray(data?.facts) ? data.facts : [], revisions: data?.revisions || [], proactive: data?.proactive || {}, news: data?.news || {}, behavior: data?.behavior || {} };
       setPersonaForm(companion.data.persona);
+      renderPersonaIdentity(data.identity || state.companion?.identity || {});
+      void loadPersonaIdentity();
       renderPersonaProfiles();
       renderProactiveSettings(companion.data.proactive);
       renderNewsSettings(companion.data.news);
@@ -893,6 +1031,148 @@
       tasks: '先判断用户是在闲聊、提问还是要求执行。明确任务及时处理并智能路由；只简短说明目标，不编造已派发或已完成状态。',
       reports: '汇报由当前人设结合进度、结果和情境自然组织，不用固定模板。先说最有用的结论；失败、延迟和不确定之处讲清楚，不暴露内部编号、日志和无关附件。',
     }) }).then(data => { companion.data.behavior = data?.behavior || {}; renderBehaviorSettings(companion.data.behavior); feedback.className = 'form-feedback'; feedback.textContent = '已恢复默认行为规则。'; toast('中枢行为规则已恢复默认'); }).catch(error => { feedback.className = 'form-feedback error'; feedback.textContent = `恢复失败：${error.message}`; }).finally(() => { button.disabled = false; });
+  });
+  async function loadWorkerPool(){
+    try{const data=await api('/api/workers'),list=$('#worker-pool-list');list.replaceChildren();
+      for(const worker of data.workers){const card=make('article','memory-card');card.append(make('strong','',worker.name));
+        card.append(make('p','',worker.running?`工作中 · ${worker.queued} 个任务等待`:worker.queued?`${worker.queued} 个任务等待`:`空闲${worker.hasSession?'':' · 首次派单时建立'}`));
+        if(worker.lastTopic)card.append(make('small','',`近期工作：${worker.lastTopic}`));
+        if(worker.sessionUrl){const link=make('a','','查看 DSH 会话');link.href=worker.sessionUrl;link.target='_blank';link.rel='noopener';card.append(link);}list.append(card);
+      }$('#worker-pool-status').textContent=data.policy;
+    }catch(error){$('#worker-pool-status').textContent=error.message;}
+  }
+  $('#worker-pool-window')?.addEventListener('toggle',event=>{if(event.target.open)void loadWorkerPool();});
+  $('#worker-pool-refresh')?.addEventListener('click',()=>void loadWorkerPool());
+  setInterval(()=>{if($('#worker-pool-window')?.open)void loadWorkerPool();},15000);
+  const tokenCount=value=>value===null||value===undefined?'未知':Number(value).toLocaleString('zh-CN');
+  let dailyTokensLoading=false;
+  async function loadDailyTokens(){
+    if(dailyTokensLoading)return;dailyTokensLoading=true;
+    const status=$('#daily-token-status');
+    try{
+      const date=$('#daily-token-date').value;
+      const data=await api('/api/usage/daily'+(date?'?date='+encodeURIComponent(date):''));
+      $('#daily-token-date').value=data.date;$('#daily-token-budget').value=data.settings.dailyBudget;
+      $('#daily-token-export').href='/api/usage/daily/export?date='+encodeURIComponent(data.date);
+      const t=data.totals;$('#daily-token-totals').replaceChildren();
+      for(const [name,key] of [['已采集总量','totalTokens'],['输入（含缓存）','inputTokens'],['输出','outputTokens'],['缓存命中（已含在输入内）','cacheReadTokens']])$('#daily-token-totals').append(make('p','',`${name}：${tokenCount(t[key].total)} Token`));
+      const lines=(selector,rows)=>{const host=$(selector);host.replaceChildren();for(const row of rows)host.append(make('p','',row));if(!rows.length)host.append(make('p','','尚无采集记录。'));};
+      lines('#daily-token-groups',data.groups.map(g=>`${g.engine.toUpperCase()} · ${g.role}：${tokenCount(g.totalTokens.total)} Token`));
+      lines('#daily-token-sessions',data.sessions.map(s=>`${s.name}：${tokenCount(s.totalTokens.total)} Token`));
+      lines('#daily-token-history',data.history.map(d=>`${d.day}：${tokenCount(d.totalTokens)} Token${d.unknownEntries?'（部分条目缺失用量）':''}`));
+      status.textContent=`上海时间统计 · ${t.entries} 条用量记录；${data.coverage.withoutUsage||0} 次运行尚无用量回传；${data.quality.unidentifiedEntries} 条缺少可靠去重标识。${data.budget.exceeded?'已达到每日用量提醒线。':''}`;
+      status.className=data.budget.exceeded?'form-feedback error':'form-feedback';
+      const old=data.historicalReference;$('#daily-token-reference').textContent=old&&old.entries?`历史日志参考：${tokenCount(old.totalTokens)} Token。${old.note}${old.truncated?'旧日志样本已截断。':''}`:'';
+      $('#daily-token-scope').textContent=`${data.scope} ${data.quality.note} 采集启用时间：${new Date(data.settings.collectionStartedAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}。`;
+    }catch(error){status.textContent=error.message;}finally{dailyTokensLoading=false;}
+  }
+  $('#daily-token-window')?.addEventListener('toggle',event=>{if(event.target.open)void loadDailyTokens();});
+  $('#daily-token-form')?.addEventListener('submit',event=>{event.preventDefault();void loadDailyTokens();});
+  $('#daily-token-refresh')?.addEventListener('click',()=>void loadDailyTokens());
+  $('#daily-token-budget-form')?.addEventListener('submit',async event=>{
+    event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;
+    try{await api('/api/usage/daily/settings',{method:'POST',body:json({dailyBudget:Number($('#daily-token-budget').value)})});await loadDailyTokens();}
+    catch(error){$('#daily-token-status').textContent=error.message;}finally{button.disabled=false;}
+  });
+  setInterval(()=>{if($('#daily-token-window')?.open)void loadDailyTokens();},60000);
+  function renderStickers(items) {
+    const list=$('#sticker-list');list.replaceChildren();
+    for(const item of items){
+      const card=make('article','sticker-card'),image=document.createElement('img');
+      image.src=item.preview;image.alt=item.title;image.loading='lazy';card.append(image,make('small','',item.title));
+      const link=make('a','','来源');link.href=item.source;link.target='_blank';link.rel='noopener noreferrer';card.append(link);
+      card.append(make('small','',item.reviewStatus==='favorite'?'已收藏':item.reviewStatus==='approved'?'已审核':'待看图挑选'));
+      for(const [decision,label] of [['favorite','喜欢这张'],['rejected','不好看，不再用']]){
+        const feedback=make('button','',label);feedback.type='button';feedback.addEventListener('click',async()=>{
+          feedback.disabled=true;
+          try{await api(`/api/companion/stickers/${encodeURIComponent(item.id)}/review`,{method:'POST',body:json({decision,score:decision==='favorite'?5:0,source:'user'})});const r=await api('/api/companion/stickers');renderStickers(r.items);$('#sticker-status').textContent=decision==='favorite'?'已收藏，今后优先选这类画风。':'已移出可用图库，不会再发送这张。';}
+          catch(error){$('#sticker-status').textContent=error.message;feedback.disabled=false;}
+        });card.append(feedback);
+      }
+      const send=make('button','','发到 QQ');send.type='button';send.addEventListener('click',async()=>{
+        send.disabled=true;
+        try{const r=await api(`/api/companion/stickers/${encodeURIComponent(item.id)}/send`,{method:'POST',body:'{}'});$('#sticker-status').textContent=r.message;}
+        catch(error){$('#sticker-status').textContent=error.message;}finally{send.disabled=false;}
+      });send.disabled=!['approved','favorite'].includes(item.reviewStatus);card.append(send);list.append(card);
+    }
+  }
+  $('#sticker-window')?.addEventListener('toggle',async event=>{
+    if(!event.target.open)return;
+    try{const r=await api('/api/companion/stickers');$('#stickers-enabled').checked=r.settings.enabled;$('#stickers-auto-collect').checked=r.settings.autoCollect;renderStickers(r.items);}
+    catch(error){$('#sticker-status').textContent=error.message;}
+  });
+  $('#stickers-enabled')?.addEventListener('change',async event=>{
+    const toggle=event.target;toggle.disabled=true;
+    try{await api('/api/companion/stickers/settings',{method:'POST',body:json({enabled:toggle.checked})});}
+    catch(error){toggle.checked=!toggle.checked;$('#sticker-status').textContent=error.message;}finally{toggle.disabled=false;}
+  });
+  $('#stickers-auto-collect')?.addEventListener('change',async event=>{
+    const toggle=event.target;toggle.disabled=true;try{await api('/api/companion/stickers/settings',{method:'POST',body:json({autoCollect:toggle.checked})});}catch(error){toggle.checked=!toggle.checked;$('#sticker-status').textContent=error.message;}finally{toggle.disabled=false;}
+  });
+  $('#sticker-search-form')?.addEventListener('submit',async event=>{
+    event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;$('#sticker-status').textContent='正在找表情并检查图片…';
+    try{const r=await api('/api/companion/stickers/search',{method:'POST',body:json({query:$('#sticker-query').value.trim()})});renderStickers(r.items);$('#sticker-status').textContent=r.message||`找到 ${r.items.length} 张${r.cached?'，来自本机缓存':''}。`;}
+    catch(error){$('#sticker-status').textContent=error.message;}finally{button.disabled=false;}
+  });
+  async function loadTimeline() {
+    const status = $('#timeline-status'), list = $('#timeline-list');
+    if (!status || !list) return;
+    status.textContent = '读取时间线…';
+    try {
+      const query = $('#timeline-search')?.value.trim() || '';
+      const data = await api('/api/companion/timeline?q=' + encodeURIComponent(query));
+      list.replaceChildren();
+      for (const entry of data.entries || []) {
+        const card = make('article', 'memory-card');
+        card.append(make('strong', '', `${entry.occurredAt || '日期待确定'} · ${entry.title}`));
+        card.append(make('small', '', `${entry.dateBasis} · ${entry.sourceLabel}`));
+        if (entry.sourceRefs?.length > 1) card.append(make('small', '', `同内容记录合并展示，共 ${entry.sourceRefs.length} 个来源，原文均保留。`));
+        if (entry.relatedIds?.length) card.append(make('small', '', `有 ${entry.relatedIds.length} 条相近记录，原文独立保留。`));
+        card.append(make('p', '', entry.text.slice(0, 1000)));
+        list.append(card);
+      }
+      status.textContent = `显示 ${(data.entries || []).length} 条。每分钟自动整理；日期不明的记录排在后面。`;
+    } catch (error) { status.textContent = `读取失败：${error.message}`; }
+  }
+  $('#timeline-window')?.addEventListener('toggle', event => { if (event.target.open) void loadTimeline(); });
+  $('#timeline-search-form')?.addEventListener('submit', event => { event.preventDefault(); void loadTimeline(); });
+  $('#timeline-refresh')?.addEventListener('click', async event => {
+    event.target.disabled = true;
+    try { await api('/api/companion/timeline/refresh', { method: 'POST', body: '{}' }); await loadTimeline(); }
+    catch (error) { $('#timeline-status').textContent = error.message; }
+    finally { event.target.disabled = false; }
+  });
+  $('#timeline-note-form')?.addEventListener('submit', async event => {
+    event.preventDefault(); const button = event.target.querySelector('button'); button.disabled = true;
+    try {
+      await api('/api/companion/timeline/notes', { method: 'POST', body: json({ text: $('#timeline-note').value, title: $('#timeline-title').value, occurredAt: $('#timeline-date').value || undefined }) });
+      event.target.reset(); await loadTimeline(); toast('笔记已保存并加入时间线');
+    } catch (error) { $('#timeline-status').textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  async function loadPhoneSocial(){
+    const status=$('#phone-social-status'),list=$('#phone-social-drafts');if(!status||!list)return;
+    try{const data=await api('/api/companion/social');status.textContent=data.phone?.connected?`手机已连接 · ${(data.phone.apps||[]).map(app=>app.name+(app.installed?'已安装':'未安装')).join(' · ')}`:data.phone?.message||'手机未连接';
+      list.replaceChildren();const labels={pending:'待你确认',approved:'已确认，等待手机工作席位',submitting:'正在提交，请勿重复',posted:'已核对到评论',uncertain:'结果待核对，不自动重发',cancelled:'已取消',expired:'已过期',needs_attention:'需要处理'};
+      for(const draft of data.drafts.slice(0,8)){const card=make('article','memory-card');card.append(make('strong','',`${draft.platform} · ${draft.title}`),make('p','',draft.content),make('small','',labels[draft.status]||draft.status));
+        if(draft.error)card.append(make('p','',draft.error));
+        if(draft.status==='pending')for(const approve of [true,false]){const button=make('button','system-check',approve?'发布这条评论':'取消草稿');button.type='button';button.addEventListener('click',async()=>{button.disabled=true;try{await api(`/api/companion/social/drafts/${encodeURIComponent(draft.id)}`,{method:'POST',body:json({approve})});await loadPhoneSocial();}catch(error){toast(error.message);button.disabled=false;}});card.append(button);}list.append(card);}
+      if(!data.drafts.length)list.append(make('p','empty-state','还没有评论草稿。'));
+    }catch(error){status.textContent=`读取失败：${error.message}`;}
+  }
+  $('#phone-social-window')?.addEventListener('toggle',()=>{if($('#phone-social-window').open)void loadPhoneSocial();});
+  setInterval(()=>{if($('#phone-social-window')?.open)void loadPhoneSocial();},15000);
+  $('#phone-social-form')?.addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{const result=await api('/api/companion/social/browse',{method:'POST',body:json({platform:$('#phone-social-platform').value,goal:$('#phone-social-goal').value,requestKey:crypto.randomUUID()})});toast(`已交给「${result.sessionTitle}」浏览`);await loadPhoneSocial();}catch(error){$('#phone-social-status').textContent=error.message;}finally{button.disabled=false;}});
+  $('#phone-autonomy-enabled')?.addEventListener('change', async event => {
+    const toggle = event.target, requested = toggle.checked;
+    toggle.disabled = true;
+    try {
+      const data = await api('/api/companion/proactive', { method: 'POST', body: json({ phoneAutonomyEnabled: requested }) });
+      companion.data.proactive = data.proactive;
+      renderProactiveSettings(data.proactive);
+      toast(requested ? '已允许空闲时自主使用手机' : '已暂停新的手机自主探索，当前任务继续完成');
+    } catch (error) { toggle.checked = !requested; toast(`更新手机自主使用设置失败：${error.message}`); }
+    finally { toggle.disabled = false; }
   });
   $('#proactive-enabled')?.addEventListener('change', async event => {
     const toggle = event.currentTarget;
@@ -942,20 +1222,24 @@
     const patch = {
       address: $('#persona-address').value.trim(), name: $('#persona-name').value.trim(),
       avatar: $('#persona-avatar').value, themeColor: $('#persona-theme-color').value,
+      qqNickname: $('#persona-qq-nickname').value.trim(), voiceProfileId: $('#persona-voice-profile').value || null,
+      reportStyle: $('#persona-report-style').value.trim(),
+      reportExamples: $('#persona-report-examples').value.trim().split(/\r?\n\s*\r?\n/).map(group=>group.trim()).filter(Boolean),
       style: $('#persona-style').value.trim(), background: $('#persona-background').value.trim(),
-      examples: $('#persona-examples').value.split(/\r?\n/).map(line=>line.trim()).filter(Boolean),
+      examples: $('#persona-examples').value.trim().split(/\r?\n\s*\r?\n/).map(group=>group.trim()).filter(Boolean),
     };
     try {
       await api('/api/companion/persona', { method: 'POST', body: json(patch) });
       $('#persona-form').dataset.dirty = 'false';
-      feedback.textContent = '已保存。称呼、风格和表达会从下一条聊天开始生效。';
+      feedback.textContent = '人设已保存，QQ同步中/未完成。称呼、风格和表达会从下一条聊天开始生效。';
       toast('人设已保存，下一条聊天开始生效');
       await loadCompanion({ preserveDrafts: true });
+      await Promise.all([loadPersonaIdentity(), loadPersonaVoiceProfiles()]);
     } catch (error) { feedback.className = 'form-feedback error'; feedback.textContent = `保存人设失败：${error.message}`; }
     finally { button.disabled = false; }
   });
   $('#persona-form').addEventListener('input', event => {
-    if (['persona-address','persona-name','persona-avatar','persona-theme-color','persona-style','persona-background','persona-examples'].includes(event.target.id)) {
+    if (['persona-report-style','persona-report-examples','persona-address','persona-name','persona-avatar','persona-theme-color','persona-style','persona-background','persona-examples','persona-qq-nickname','persona-voice-profile'].includes(event.target.id)) {
       $('#persona-form').dataset.dirty = 'true';
       if(event.target.id==='persona-avatar'||event.target.id==='persona-theme-color'||event.target.id==='persona-name') {
         applyPersonaAppearance({name:$('#persona-name').value,avatar:$('#persona-avatar').value,themeColor:$('#persona-theme-color').value});
@@ -972,6 +1256,8 @@
       const data = await api('/api/companion/persona/switch', { method: 'POST', body: json({ id: select.value }) });
       companion.data = { ...companion.data, ...data };
       setPersonaForm(companion.data.persona); renderPersonaProfiles(); renderChat();
+      renderPersonaIdentity(data.identity || state.companion?.identity || {});
+      await Promise.all([loadPersonaIdentity(), loadPersonaVoiceProfiles()]);
       toast(`已切换到「${companion.data.personaProfiles.find(item => item.id === companion.data.activePersonaId)?.label || '当前人设'}」；记忆保持共用`);
     } catch (error) { toast(`切换人设失败：${error.message}`); await loadCompanion(); }
     finally { select.disabled = false; }
@@ -1006,6 +1292,29 @@
     const button=event.currentTarget,feedback=$('#persona-feedback');button.disabled=true;feedback.className='form-feedback';feedback.textContent='正在安全重载中枢…';
     try { await api('/api/system/reload',{method:'POST',body:json({})});feedback.textContent='重载请求已接受；中枢恢复后会沿用当前人设与共用记忆。';toast('中枢正在重载'); }
     catch(error){feedback.className='form-feedback error';feedback.textContent=`重载未开始：${error.message}`;button.disabled=false;}
+  });
+  async function loadMemoryAudit(result=null) {
+    const data=result||await api('/api/companion/memory/audit');
+    $('#memory-audit-status').textContent=`整理进度已保存，${data.pending} 条资料需核对。`;
+    const list=$('#memory-audit-list');list.replaceChildren();
+    for(const item of data.items||[]) {
+      const card=make('div','memory-card');card.append(make('p','','历史原话：'+item.quote),make('p','small-note','现有资料：'+(item.conflictWith||'尚无')));
+      for(const [action,label] of [['keep-current','保留现有资料'],['review-quote','加入待确认记忆']]) {
+        const button=make('button','',label);button.type='button';button.addEventListener('click',async()=>{
+          button.disabled=true;
+          try{await api(`/api/companion/memory/audit/${encodeURIComponent(item.id)}/resolve`,{method:'POST',body:json({action})});await loadMemoryAudit();await loadCompanion({preserveDrafts:true});}
+          catch(error){toast(error.message);button.disabled=false;}
+        });card.append(button);
+      }
+      list.append(card);
+    }
+    if(!list.childNodes.length)list.append(make('p','small-note','没有待核对的冲突。'));
+  }
+  $('#memory-audit-window').addEventListener('toggle',()=>{if($('#memory-audit-window').open)void loadMemoryAudit().catch(error=>toast(error.message));});
+  $('#memory-audit-scan').addEventListener('click',async event=>{
+    const button=event.currentTarget;button.disabled=true;
+    try{const result=await api('/api/companion/memory/audit',{method:'POST',body:json({budget:100})});await loadMemoryAudit(result);await loadCompanion({preserveDrafts:true});toast(`本批找到 ${result.candidates} 条候选、${result.conflicts} 条待核对冲突。`);}
+    catch(error){toast(error.message);}finally{button.disabled=false;}
   });
   $('#memory-create-form').addEventListener('submit', async event => {
     event.preventDefault();
@@ -1050,8 +1359,13 @@
   }
   async function refreshState() {
     try {
-      const data = await api('/api/state');
+      const data = await api('/api/state?view=compact');
       for (const key of ['tasks', 'approvals', 'artifacts', 'errors', 'chat', 'health']) state[key] = Array.isArray(data?.[key]) ? data[key] : (data?.[key] || (['health'].includes(key) ? {} : []));
+      state.taskCount=data.taskCount;
+      if(!taskHistoryStarted)taskHistoryCursor=data.taskCursor||null;
+      state.tasks=[...new Map([...taskHistoryPage,...state.tasks].map(task=>[task.id,task])).values()];
+      if($('#task-history-more'))$('#task-history-more').hidden=!taskHistoryCursor;
+      state.artifactCount = Number.isInteger(data?.artifactCount)?data.artifactCount:state.artifacts.length;
       state.companion = data?.companion || state.companion || {};
       if (companion.loaded && state.companion.proactive) {
         companion.data.proactive = state.companion.proactive;
@@ -1061,14 +1375,16 @@
         companion.data.news = state.companion.news;
         renderNewsSettings(companion.data.news);
       }
-      if (companion.loaded && state.companion.diary) renderDiary({ settings: state.companion.diary, entries: state.companion.diary.entries || [] });
+      if (companion.loaded && state.companion.diary && !data.compact) renderDiary({ settings: state.companion.diary, dailyReview: state.companion.dailyReview, entries: state.companion.diary.entries || [] });
+      if (companion.loaded && state.companion.cognition) renderCognition({settings:state.companion.cognition});
+      if (companion.loaded && state.companion.identity) renderPersonaIdentity(state.companion.identity);
       state.directSession=data?.directSession || {enabled:false,title:'',connected:false};
       state.specialists=data.specialists || {};
       $('#state-error').hidden = true;
       $('#state-error').textContent = '';
       render();
       if (selectedTaskId) void loadTaskEvents(selectedTaskId);
-      if ($('#page-archive').classList.contains('active')) void loadLibrary();
+      if ($('#page-archive').classList.contains('active')&&!$('#library-workspace')?.hidden) void loadLibrary();
     } catch (error) {
       setConnection(false, '连接失败');
       $('#state-error').hidden = false; $('#state-error').textContent = `无法读取中控状态：${error.message}`;
@@ -1099,14 +1415,35 @@
       if(engineSave)engineSave.disabled=data?.directorBusy===true;
       if(engineSelect)engineSelect.disabled=data?.directorBusy===true;
       if(engineFeedback)engineFeedback.textContent=data?.directorBusy?'主管正在处理这轮对话，完成后可以切换。':`当前接入：${directorEngine==='codex'?'Codex':'DSH 3080'}`;
+      const workerSelect=$('#worker-engine-select'),workerFeedback=$('#worker-engine-feedback');
+      const workerEngine=['dsh','codex','auto'].includes(data?.workerEngine)?data.workerEngine:'dsh';
+      if(workerSelect&&document.activeElement!==workerSelect&&!workerSelect.dataset.dirty)workerSelect.value=workerEngine;
+      if(workerFeedback&&!workerSelect?.dataset.dirty)workerFeedback.textContent=`当前任务执行：${workerEngine==='auto'?'自动选择':workerEngine==='codex'?'固定 Codex':'固定 DSH 3080'}`;
+      if($('#worker-engine-save'))$('#worker-engine-save').disabled=false;
     } catch (error) {
       $('#system-primary').textContent = '暂不可用';
       $('#system-summary').textContent = `守护状态暂不可用：${error.message}`;
       $('#system-check').disabled = true;
       $('#director-engine-save').disabled = true;
       $('#director-engine-select').disabled = true;
+      if($('#worker-engine-save'))$('#worker-engine-save').disabled=true;
     }
   }
+  async function loadAgentCompletions(){try{
+    const data=await api('/api/agents/completions');$('#agent-completion-enabled').checked=data.enabled;
+    $('#agent-completion-status').textContent=`${data.enabled?'已启用':'已暂停'} · 从 ${timeLabel(data.since)} 接收新结果 · ${data.pending} 条待整理${data.lastScan?' · 最近扫描 '+timeLabel(data.lastScan):''}${data.lastError?' · 最近问题：'+data.lastError:''}`;
+    const sources=$('#agent-completion-sources');sources.replaceChildren();for(const source of data.sources)sources.append(make('p','',`${source.engine}：${source.mode}`));
+    const recent=$('#agent-completion-recent');recent.replaceChildren();for(const row of data.recent){const status=row.status==='completed'?'本轮已完成':row.status==='failed'?'本轮失败':'本轮中断';recent.append(make('p','',`「${row.title}」 · ${status} · ${row.delivery==='sent'?'QQ 已发送':row.delivery==='uncertain'?'发送结果待核对':row.state==='pending'?'待助手整理':'汇报处理中'}`));}
+  }catch(error){$('#agent-completion-status').textContent=`读取失败：${error.message}`;}}
+  $('#agent-completion-window')?.addEventListener('toggle',()=>{if($('#agent-completion-window').open)void loadAgentCompletions();});
+  setInterval(()=>{if($('#agent-completion-window')?.open)void loadAgentCompletions();},15000);
+  $('#agent-completion-enabled')?.addEventListener('change',async event=>{const toggle=event.target;toggle.disabled=true;try{await api('/api/agents/completions/settings',{method:'POST',body:json({enabled:toggle.checked})});await loadAgentCompletions();}catch(error){toggle.checked=!toggle.checked;toast(error.message);}finally{toggle.disabled=false;}});
+  $('#worker-engine-select')?.addEventListener('change',event=>{event.target.dataset.dirty='true';$('#worker-engine-feedback').textContent='尚未保存，点击“保存任务引擎”后生效。';});
+  $('#worker-engine-form')?.addEventListener('submit',async event=>{
+    event.preventDefault();const select=$('#worker-engine-select'),button=$('#worker-engine-save'),feedback=$('#worker-engine-feedback');button.disabled=true;
+    try{const result=await api('/api/system/worker-engine',{method:'POST',body:json({engine:select.value})});delete select.dataset.dirty;select.value=result.engine;await loadSystem();toast('任务执行引擎已保存，从下一条消息生效');}
+    catch(error){feedback.textContent=`保存失败：${error.message}`;}finally{button.disabled=false;}
+  });
   $('#director-engine-form')?.addEventListener('submit',async event=>{
     event.preventDefault();
     const select=$('#director-engine-select'),button=$('#director-engine-save'),feedback=$('#director-engine-feedback');
@@ -1172,9 +1509,10 @@
     if (!$('#computer-action-list')) return;
     computer.loading = true; renderComputerActions();
     try {
+      const readiness = await api('/api/computer/status');
       const data = await api('/api/computer/actions');
       computer.actions = Array.isArray(data?.actions) ? data.actions : [];
-      $('#computer-availability').textContent = data?.mode === 'interactive' ? 'Notepad 输入需逐次批准' : data?.mode === 'readonly' ? '本机只读' : '已停用';
+      $('#computer-availability').textContent = data?.mode === 'interactive' ? '已审核控件操作，逐次批准' : data?.mode === 'readonly' ? '本机只读' : '已停用';
       $('#computer-feedback').textContent = '';
     } catch (error) {
       computer.actions = [];
@@ -1182,12 +1520,12 @@
       $('#computer-feedback').textContent = error.message;
     } finally { computer.loading = false; renderComputerActions(); }
   }
-  async function submitComputerAction(tool, args) {
+  async function submitComputerAction(tool, args, conditions={}) {
     const feedback = $('#computer-feedback');
     for (const button of [$('#computer-list-windows'), $('#computer-window-form button')]) button.disabled = true;
     feedback.textContent = '正在提交只读检查申请…';
     try {
-      const result = await api('/api/computer/actions', { method: 'POST', body: json({ taskId: 'desktop-inspection', tool, args }) });
+      const result = await api('/api/computer/actions', { method: 'POST', body: json({ taskId: 'desktop-inspection', tool, args, ...conditions }) });
       if (result?.action) computer.actions = [result.action, ...computer.actions.filter(item => item.id !== result.action.id)].slice(0, 10);
       feedback.textContent = '申请已提交。请核对下面的实际操作摘要，再明确选择批准或拒绝。';
       renderComputerActions();
@@ -1196,11 +1534,12 @@
   }
   async function answerComputerAction(id, op, approve, deny) {
     approve.disabled = true; deny.disabled = true;
-    $('#computer-feedback').textContent = op === 'approve' ? '正在执行你批准的只读检查…' : '正在记录拒绝…';
+    $('#computer-feedback').textContent = op === 'approve' ? '正在执行你批准的操作…' : '正在记录拒绝…';
     try {
       const result = await api(`/api/computer/actions/${encodeURIComponent(id)}/${op}`, { method: 'POST', body: '{}' });
       if (result?.action) computer.actions = computer.actions.map(item => item.id === id ? result.action : item);
-      $('#computer-feedback').textContent = op === 'approve' ? (result.action?.tool === 'type_text' ? '输入已执行并重新读取目标窗口，请检查复核结果后再确认。' : '检查已返回；页面仅显示安全状态，结果会交给本机视觉会话。') : '已拒绝，这项操作没有执行。';
+      $('#computer-feedback').textContent = op === 'approve' ? (['type_text','click','press_key','scroll'].includes(result.action?.tool) ? '操作已返回并重新读取目标窗口，请检查复核结果后再确认。' : '检查已返回；页面仅显示安全状态，结果会交给本机视觉会话。') : '已拒绝，这项操作没有执行。';
+      if(op==='approve'&&result.action?.tool==='get_window_state'){const view=await api(`/api/computer/actions/${encodeURIComponent(id)}/targets`);const select=$('#computer-control-target');select.replaceChildren(new Option('选择刚观察到的控件',''));for(const snapshot of view.targets||[])for(const e of snapshot.elements||[]){select.add(new Option([e.role,e.label].filter(Boolean).join(' · ')||'未命名控件',json({pid:snapshot.pid,window_id:snapshot.window_id,element_token:e.element_token,observationActionId:id})));}}
       renderComputerActions();
     } catch (error) { $('#computer-feedback').textContent = `操作未完成：${error.message}`; approve.disabled = false; deny.disabled = false; }
   }
@@ -1225,19 +1564,15 @@
     } catch (error) { $('#computer-feedback').textContent = `尚未解除桌面锁定：${error.message}`; button.disabled = false; }
   }
   async function searchKnowledge(query) {
-    if (!query) {
-      activeSearch = ''; searchResults = [];
-      renderArtifacts(state.artifacts.slice(0, 10), state.artifacts.length, 'recent');
-      return;
-    }
     activeSearch = query;
     const submit = $('#search-form button'); submit.disabled = true;
     $('#archive-count').textContent = '搜索中…';
     $('#knowledge-list').replaceChildren(make('div', 'empty-state', '正在搜索…'));
     try {
-      const data = await api(`/api/knowledge?q=${encodeURIComponent(query)}`);
+      const data = await api(`/api/files/results?q=${encodeURIComponent(query)}`);
       searchResults = Array.isArray(data) ? data : (data?.artifacts || data?.records || []);
-      renderArtifacts(searchResults, searchResults.length, 'search');
+      archiveResultCount = data.total ?? searchResults.length;
+      renderArtifacts(searchResults, archiveResultCount, query ? 'search' : 'recent');
     } catch (error) { $('#archive-count').textContent = '搜索失败'; $('#knowledge-list').replaceChildren(make('div', 'empty-state', `搜索失败：${error.message}`)); }
     finally { submit.disabled = false; }
   }
@@ -1251,6 +1586,90 @@
     catch (error) { $('#chat-error').hidden = false; $('#chat-error').textContent = `消息发送失败：${error.message}`; }
     finally { button.disabled = false; input.disabled = false; input.focus(); }
   });
+  let drawingTimer=null,drawingKey=null;
+  const drawingLabels={queued:'等待开始',submitting:'正在交接',running:'正在画图',completed:'已完成',failed:'生成失败',uncertain:'结果待核对'};
+  async function loadDrawings(initial=false){
+    const data=await api('/api/companion/drawings');
+    if(!Array.isArray(data.options)){$('#drawing-submit').disabled=true;throw Error('生图新入口等待安全重载；处理现有待选事项后会自动加载更新。');}
+    if(initial){$('#drawing-engine').value=data.engine;$('#drawing-submit').disabled=false;for(const option of $('#drawing-engine').options)option.disabled=data.options?.find(x=>x.value===option.value)?.available===false;}
+    const list=$('#drawing-list');list.replaceChildren();
+    for(const item of data.items||[]){const card=make('article','diary-entry');card.append(make('strong','',item.title),make('p','',`${item.engine==='codex'?'Codex · 生图':'本机生图'} · ${item.phaseLabel||drawingLabels[item.status]||item.status}`));
+      if(item.error)card.append(make('p','inline-error',item.error));
+      if(item.image){const image=document.createElement('img');image.src=item.image;image.alt=item.title;image.loading='lazy';image.style.maxWidth='100%';card.append(image);card.append(make('small','',item.delivery==='sent'?'QQ 发送接口已确认':item.delivery==='pending'?'等待发送到 QQ':item.delivery==='uncertain'?'QQ 发送结果未知':'尚未发送到 QQ'));}
+      list.append(card);
+    }
+  }
+  $('#drawing-open').addEventListener('click',()=>{const dialog=$('#drawing-dialog');if(!dialog.open)dialog.showModal();void loadDrawings(true).catch(e=>{$('#drawing-feedback').textContent=e.message;});clearInterval(drawingTimer);drawingTimer=setInterval(()=>{if(dialog.open)void loadDrawings().catch(()=>{});},5000);});
+  $('#drawing-dialog').addEventListener('close',()=>clearInterval(drawingTimer));
+  $('#drawing-engine').addEventListener('change',async()=>{try{await api('/api/companion/drawings/settings',{method:'POST',body:json({engine:$('#drawing-engine').value})});$('#drawing-feedback').textContent='已设为默认生图方式，也可以在每次画图时切换。';}catch(e){$('#drawing-feedback').textContent=e.message;await loadDrawings(true);}});
+  $('#drawing-form').addEventListener('submit',async event=>{event.preventDefault();const button=$('#drawing-submit');button.disabled=true;drawingKey||=crypto.randomUUID();
+    try{const item=await api('/api/companion/drawings',{method:'POST',body:json({title:$('#drawing-name').value,prompt:$('#drawing-prompt').value,engine:$('#drawing-engine').value,share:$('#drawing-share').checked,key:drawingKey})});drawingKey=null;$('#drawing-feedback').textContent=`已交给${item.engine==='codex'?' Codex「生图」会话':'本机生图'}，完成后会显示在这里。`;await loadDrawings();}
+    catch(e){$('#drawing-feedback').textContent=`尚未确认提交：${e.message}`;}finally{button.disabled=false;}
+  });
+  let voiceSettings = null;
+  const renderVoiceSettings = data => {
+    voiceSettings = data;
+    const select = $('#voice-profile');
+    select.replaceChildren();
+    for (const profile of Array.isArray(data.profiles) ? data.profiles : []) {
+      const option = document.createElement('option');
+      option.value = String(profile.id ?? '');
+      option.textContent = String(profile.label ?? profile.id ?? '未命名音色');
+      select.append(option);
+    }
+    select.value = String(data.profileId ?? '');
+    select.disabled = !data.configured || !select.options.length;
+    $('#voice-profile-save').disabled = select.disabled;
+    $('#voice-enabled').checked = Boolean(data.enabled);
+    $('#voice-enabled').disabled = !data.configured;
+  };
+  $('#voice-settings-open').addEventListener('click', async () => {
+    const dialog = $('#voice-settings-dialog');
+    $('#voice-settings-feedback').textContent = '正在读取语音设置…';
+    if (!dialog.open) dialog.showModal();
+    try {
+      const data = await api('/api/voice');
+      renderVoiceSettings(data);
+      $('#voice-settings-feedback').textContent = data.configured ? (data.enabled ? '当前使用语音回复。' : '当前使用文字回复。') : '语音服务尚未配置。';
+    } catch (error) { $('#voice-settings-feedback').textContent = `读取失败：${error.message}`; }
+  });
+  $('#voice-profile-save').addEventListener('click', async () => {
+    if (!voiceSettings) return;
+    const select = $('#voice-profile'), button = $('#voice-profile-save'), previous = String(voiceSettings.profileId ?? '');
+    const requested = select.value;
+    button.disabled = true; select.disabled = true; $('#voice-enabled').disabled = true;
+    $('#voice-settings-feedback').textContent = '正在切换音色…';
+    try {
+      const data = await api('/api/voice', { method: 'POST', body: json({ profileId: requested }) });
+      renderVoiceSettings(data);
+      $('#voice-settings-feedback').textContent = '音色已切换。';
+    } catch (error) {
+      select.value = previous;
+      $('#voice-settings-feedback').textContent = `切换失败：${error.message}`;
+    } finally {
+      button.disabled = !voiceSettings?.configured || !select.options.length;
+      select.disabled = !voiceSettings?.configured || !select.options.length;
+      $('#voice-enabled').disabled = !voiceSettings?.configured;
+    }
+  });
+  $('#voice-enabled').addEventListener('change', async event => {
+    if (!voiceSettings) return;
+    const input = event.currentTarget, previous = Boolean(voiceSettings.enabled), requested = input.checked;
+    input.disabled = true; $('#voice-profile').disabled = true; $('#voice-profile-save').disabled = true;
+    $('#voice-settings-feedback').textContent = requested ? '正在启用语音回复…' : '正在切换文字回复…';
+    try {
+      const data = await api('/api/voice', { method: 'POST', body: json({ enabled: requested }) });
+      renderVoiceSettings(data);
+      $('#voice-settings-feedback').textContent = data.enabled ? '已切换为语音回复。' : '已切换为文字回复。';
+    } catch (error) {
+      input.checked = previous;
+      $('#voice-settings-feedback').textContent = `切换失败：${error.message}`;
+    } finally {
+      input.disabled = !voiceSettings?.configured;
+      $('#voice-profile').disabled = !voiceSettings?.configured || !$('#voice-profile').options.length;
+      $('#voice-profile-save').disabled = !voiceSettings?.configured || !$('#voice-profile').options.length;
+    }
+  });
   $('#direct-session-open').addEventListener('click',()=>{
     const dialog=$('#direct-session-dialog');
     $('#direct-session-feedback').textContent='';
@@ -1261,6 +1680,12 @@
   });
   $('#direct-session-cleanup-open').addEventListener('click',()=>{
     $('#direct-session-dialog').close();$('#session-cleanup-dialog').showModal();void loadCleanupSessions();
+  });
+  $('#session-retention-enabled').addEventListener('change',async event=>{
+    const input=event.target;input.disabled=true;
+    try{await api('/api/dsh/sessions/retention',{method:'POST',body:json({enabled:input.checked})});await loadCleanupSessions();}
+    catch(error){input.checked=!input.checked;$('#session-cleanup-feedback').textContent=error.message;}
+    finally{input.disabled=false;}
   });
   $('#session-cleanup-confirm').addEventListener('click',async()=>{
     const button=$('#session-cleanup-confirm'),list=$('#session-cleanup-list');
@@ -1307,6 +1732,7 @@
     finally { button.disabled = false; }
   });
   $('#search-form').addEventListener('submit', event => { event.preventDefault(); searchKnowledge($('#search-input').value.trim()); });
+  document.addEventListener('ai-center:archive-open', () => { void searchKnowledge($('#search-input').value.trim()); });
   $('#library-import-form').addEventListener('submit', async event => {
     event.preventDefault();
     const directory = $('#library-directory').value.trim();
@@ -1366,6 +1792,21 @@
     }
     void submitComputerAction('get_window_state', { pid, window_id });
   });
+  for(const op of ['yield','resume'])$('#computer-'+op).addEventListener('click',async()=>{
+    if(op==='resume'&&!confirm('确认桌面已空闲，并允许继续？结果未确认的旧动作仍需单独核验。'))return;
+    try{await api('/api/computer/desktop/'+op,{method:'POST',body:json({deviceId:'local',...(op==='resume'?{operatorConfirmedQuiescent:true,userContinues:true}:{})})});$('#computer-lease-state').textContent=op==='yield'?'桌面动作已暂停，业务任务继续':'已允许新动作；旧动作仍按核验状态处理';await loadComputerActions();}catch(error){$('#computer-feedback').textContent=error.message;}
+  });
+  $('#computer-control-form').addEventListener('submit',event=>{
+    event.preventDefault();try{
+      const selected=JSON.parse($('#computer-control-target').value),tool=$('#computer-control-tool').value;
+      const args={pid:selected.pid,window_id:selected.window_id,element_token:selected.element_token};
+      if(tool==='type_text')args.text=$('#computer-control-text').value;
+      if(tool==='press_key')args.key=$('#computer-control-text').value;
+      if(tool==='scroll'){args.direction='down';args.amount=3;args.by='line';}
+      const expected=$('#computer-control-expected').value;
+      void submitComputerAction(tool,args,{observationActionId:selected.observationActionId,...(expected?{postcondition:{textContains:expected}}:{})});
+    }catch{$('#computer-feedback').textContent='请先读取窗口并选择有效控件。';}
+  });
   for(const [id,kind,text] of [['maintenance-run','maintenance','检查中控目前的运行状态；只有真实中控源码缺陷才在隔离仓库修复，外部额度、网络或登录问题报告事实。'],['librarian-run','librarian','整理已有归档文件，更新中文摘要、标签和关联。']]){
     $('#'+id).addEventListener('click',async()=>{
       const button=$('#'+id);button.disabled=true;
@@ -1386,7 +1827,7 @@
       page.classList.toggle('active', visible);
     }
     if (target === 'companion' && !companion.loaded) loadCompanion();
-    if (target === 'archive') loadLibrary();
+    if (target === 'archive') {if(!$('#library-workspace')?.hidden)loadLibrary();document.dispatchEvent(new Event('ai-center:files-open'));}
     if (target === 'system') { void loadSystem(); void loadComputerActions(); }
   }
   for (const tab of tabs) {
@@ -1414,5 +1855,60 @@
   events.addEventListener('update', scheduleStateReload);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)scheduleStateReload();});
   events.onerror = () => setConnection(false, '实时连接重连中');
-  setInterval(() => { if (events.readyState !== EventSource.OPEN) { loadState(); loadSystem(); } }, 12000);
+  $('#task-history-more')?.addEventListener('click',async event=>{
+    const button=event.target;button.disabled=true;
+    try{const page=await api(`/api/tasks/history?limit=40&before=${encodeURIComponent(taskHistoryCursor)}`);taskHistoryStarted=true;taskHistoryPage=page.tasks;taskHistoryCursor=page.nextCursor;showAllTasks=true;$('#task-history-status').textContent='已按需读取一页；原任务记录保留。';await loadState();}
+    catch(error){$('#task-history-status').textContent=error.message;}finally{button.disabled=false;}
+  });
+  setInterval(() => { if (!document.hidden&&events.readyState !== EventSource.OPEN) { loadState(); loadSystem(); } }, 12000);
+})();
+
+// Voice playback shares the existing public entry so old running servers do not leave a dead button.
+(() => {
+  'use strict';
+  const $=selector=>document.querySelector(selector),dialog=$('#voice-history-dialog'),list=$('#voice-history-list');
+  const audio=$('#voice-player-audio'),player=$('#voice-player'),feedback=$('#voice-history-feedback'),status=$('#voice-player-status');
+  if(!dialog||!list||!audio)return;
+  let playlist=[],position=0;
+  const node=(tag,text)=>{const el=document.createElement(tag);if(text!==undefined)el.textContent=text;return el;};
+  const date=value=>new Date(value).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  function playPart(){
+    const part=playlist[position];if(!part)return;
+    status.textContent=`第 ${position+1} / ${playlist.length} 段`;
+    audio.src=part.url;audio.play().catch(()=>{status.textContent='请点播放器里的播放按钮继续。';});
+  }
+  function play(record,parts){
+    playlist=parts;position=0;player.hidden=false;
+    $('#voice-player-title').textContent=`${record.voice} · ${date(record.createdAt)}`;
+    dialog.close();playPart();
+  }
+  audio.addEventListener('ended',()=>{if(position+1<playlist.length){position++;playPart();}else status.textContent='播放完毕';});
+  audio.addEventListener('error',()=>{status.textContent='音频暂不可用，请刷新记录后重试。';});
+  $('#voice-player-close').addEventListener('click',()=>{audio.pause();audio.removeAttribute('src');audio.load();playlist=[];player.hidden=true;});
+  async function load(){
+    feedback.textContent='正在读取语音记录…';$('#voice-history-refresh').disabled=true;
+    try{
+      const response=await fetch('/api/voice/recordings',{credentials:'same-origin'}),data=await response.json();
+      if(response.status===404){feedback.textContent='语音回放正在等待更新加载。现有任务结束后会自动启用。';return;}
+      if(!response.ok)throw Error(data.error||'读取失败');
+      list.replaceChildren();const records=data.recordings||[];
+      if(!records.length)feedback.textContent='还没有已生成的语音。开启语音模式后，生成的回复会显示在这里。';
+      else feedback.textContent='选择一条播放；关闭此窗口或刷新聊天记录，不会打断播放器。';
+      for(const record of records){
+        const card=node('article');card.className='voice-recording';
+        card.append(node('h3',`${record.voice} · ${date(record.createdAt)}`));
+        const text=node('p',record.text);text.className='voice-recording-text';card.append(text);
+        const all=node('button',`播放全部 ${record.parts.length} 段`);all.type='button';all.addEventListener('click',()=>play(record,record.parts));card.append(all);
+        for(const part of record.parts){
+          const line=node('div');line.className='voice-recording-part';
+          const button=node('button',`播放第 ${part.index+1} 段`);button.type='button';button.addEventListener('click',()=>play(record,[part]));
+          const label=part.status==='sent'?'QQ 已确认发送':part.status==='uncertain'||part.status==='sending'?'QQ 发送结果待核对':'本地已生成';
+          line.append(button,node('span',label));card.append(line);
+        }
+        list.append(card);
+      }
+    }catch(error){feedback.textContent=`语音记录读取失败：${error.message}`;}finally{$('#voice-history-refresh').disabled=false;}
+  }
+  $('#voice-history-open').addEventListener('click',()=>{$('#voice-settings-dialog').close();dialog.showModal();void load();});
+  $('#voice-history-refresh').addEventListener('click',()=>void load());
 })();
