@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { isIP } from 'node:net';
+import { redact } from '../redact.mjs';
 
 const bili = (process.env.HUB_BILI_COMMAND || 'bili');
 const mcporterCli = (process.env.HUB_MCPORTER_CLI || 'mcporter');
@@ -23,6 +24,23 @@ export function publicWebUrl(raw) {
   try{url=new URL(raw);}catch{throw Error('请提供完整的网页地址');}
   if(!['http:','https:'].includes(url.protocol)||url.username||url.password||privateHost(url.hostname))throw Error('只允许读取公开 HTTP/HTTPS 网页');
   return url.href;
+}
+
+export function publicSearchResults(raw) {
+  const results = [];
+  const seen = new Set();
+  for (const block of String(raw ?? '').split(/\r?\n\s*---\s*\r?\n/u)) {
+    const title = block.match(/^Title:[ \t]*(.+)$/imu)?.[1]?.trim();
+    const target = block.match(/^URL:[ \t]*(\S+)$/imu)?.[1];
+    if (!title || !target) continue;
+    let url;
+    try { url = publicWebUrl(target); } catch { continue; }
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const excerpt = block.match(/^Highlights:[ \t]*([\s\S]*)$/imu)?.[1]?.trim() || '';
+    results.push({ title: redact(title).slice(0, 180), url: redact(url), excerpt: redact(excerpt).slice(0, 850) });
+  }
+  return results;
 }
 
 function execute(command,args,{spawn=nodeSpawn,timeoutMs=30000}={}) {

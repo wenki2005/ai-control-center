@@ -1,6 +1,5 @@
 import {qqReplyContext,approvalOptionAnswer} from './qq-reply-context.mjs';
 import {dshFollowIdentity} from './lifecycle/dsh-reload.mjs';
-import {cleanConversationalStyle} from './speech-style-policy.mjs';
 import {prepareQqFileContext} from './qq-file-context.mjs';
 import {fileDeliveryContext} from './hub/file-delivery-context.mjs';
 import {finishFileDelivery} from './hub/file-delivery.mjs';
@@ -10,6 +9,7 @@ import {DirectorContinuity} from './lifecycle/director-continuity.mjs';
 import {retryFixedWorkerContext} from './lifecycle/worker-continuity.mjs';
 import {taskTitleLookup} from './hub/session-titles.mjs';
 import {enqueueTaskEvent} from './hub/event-chain.mjs';
+import {CodexDirect} from './hub/codex-direct.mjs';
 import {InternalRepair} from './observability/internal-repair.mjs';
 import {inspectRepairThread,runRepairTurn} from './observability/codex-repair-runner.mjs';
 import {repairDeliveryState} from './observability/repair-delivery-state.mjs';
@@ -19,19 +19,16 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdirSync, statSync, globSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute, sep, dirname } from 'node:path';
 import { realpath, rm, stat } from 'node:fs/promises';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { redact } from './redact.mjs';
-import { conversationalParts } from './delivery.mjs';
+import { conversationalParts, userFacingTaskText } from './delivery.mjs';
 import { CompanionConversation, conversationMessages } from './companion-conversation.mjs';
 import { isMenuCommand, quickMenu, voiceModeCommand } from './quick-menu.mjs';
 import { sessionDisplayName } from './session-label.mjs';
 import { isInternalArtifact, isQqShareableArtifact } from './knowledge/share-policy.mjs';
 import { collectTaskDeliverables } from './knowledge/task-deliverables.mjs';
 import { RepairReturns } from './repair-return.mjs';
-import { resolveCodexExecutable } from './adapters/codex.mjs';
 import { buildTaskPrompt } from './prompts/task.mjs';
-import { loadSessionDocuments } from './prompts/session-documents.mjs';
+import { codexDirectorPersona, loadSessionDocuments } from './prompts/session-documents.mjs';
 import { recentNativeContinuity, recentNativeControlState, writeNativeContext, directorRequestReferences } from './prompts/native-context.mjs';
 import {notificationContext} from './knowledge/notification-context.mjs';
 import { allowsEngine,requestedEngine,resolveDispatchEngine,parseExplicitEngineCommand,requiresPhoneResource } from './routing/engine-policy.mjs';
@@ -41,19 +38,20 @@ import { taskFailureDiagnostic } from './observability/task-failure.mjs';
 import { reconcileDirectBridgeRecords } from './lifecycle/direct-bridges.mjs';
 import { WorkerSupervision } from './hub/worker-supervision.mjs';
 import { resolveWorkerContext } from './routing/dispatch-context.mjs';
+import {resolveSessionContinuation,isSessionContinuationError,continuationRequested,independentRequest} from './routing/session-continuation.mjs';
+import {orchestrationResult} from './hub/tool-orchestration.mjs';
 import { publishSupervisorProgress,stripSupervisorAck,linkedSupervisorTask,supervisorDispatches,stripSupervisorDispatches } from './hub/supervisor-progress.mjs';
 import {contextInputTokens} from './prompts/review-context.mjs';
 import { retractChatMessage } from './hub/chat-retraction.mjs';
-import { fixedWorkerContext,selectFixedWorkerContext,fixedWorkerSlotForTask,fixedWorkerSlotCount,fixedWorkerHasPending,rememberFixedWorker,fixedWorkerBusy } from './routing/fixed-worker.mjs';
+import { fixedWorkerContext,selectFixedWorkerContext,fixedWorkerSlotForTask,fixedWorkerSlotCount,fixedWorkerHasPending,rememberFixedWorker,fixedWorkerBusy,requestedFixedWorker,isFixedWorkerSlot } from './routing/fixed-worker.mjs';
 import { buildWorkHandoff } from './hub/work-handoff.mjs';
 import {compactNativeHandoff} from './prompts/chat-runtime.mjs';
 import { guardControlCommand } from './hub/control-confirmation.mjs';
 import { TaskAmendments } from './hub/task-amendments.mjs';
 import {TaskErrorRetries} from './lifecycle/task-error-retries.mjs';
-import {errorStrategy} from './error-strategy.mjs';
+import {codexWriterBusy,errorStrategy} from './error-strategy.mjs';
 
 const active=new Set(['queued','running','waiting']);
-const execFileAsync=promisify(execFile);
 const SESSION_GENERIC_TERMS=new Set([
   '只读','只回','回报','任务','结果','项目','文件','创建','修改','运行','命令','执行','实际','当前','检查','完成','使用','进行','一次','返回','系统','问题','工作','报告',
   '不要','调用','工具','回复','仅回','只用','文字','收到','正常','连接','验收','联调','自检','视觉','模型','会话','请求','帮我','请只','请仅','任何','这一','句话','一下','你好',
@@ -68,9 +66,7 @@ function sessionTerms(value) {
   for(const block of text.match(/[\u4e00-\u9fff]{2,}/gu)||[])for(let i=0;i<block.length-1;i++)words.add(block.slice(i,i+2));
   return new Set([...words].filter(term=>!SESSION_GENERIC_TERMS.has(term)));
 }
-export function userFacingTaskText(value) {
-  return cleanConversationalStyle(String(value ?? '').replace(/(?:任务\s*(?:ID|编号|标识)\s*[:：]?\s*)?\bt-[a-f0-9][a-f0-9-]{7,}\b[。；;]?/gi,'').trim());
-}
+export { userFacingTaskText };
 export function dispatchEngineName(engine) {return engine==='codex'?'Codex':engine==='workbuddy'?'WorkBuddy':engine==='dsh'?'DSH':String(engine || '引擎');}
 function bodyText(payload) {
   const content=Array.isArray(payload?.content)?payload.content:[];
@@ -129,12 +125,31 @@ export class Hub {
       failTask:(task,error)=>this.fail(task.id,error)});
     this.repairReturns=this.codexRepairThreadId?new RepairReturns({store,threadId:this.codexRepairThreadId,sessionRoot:this.codexSessionRoot,
       notify:(text,key)=>this.notification(text,key),onReply:text=>this.say(text,{source:'codex-repair'})}):null;
+    this.codexDirect=new CodexDirect(this);
   }
   emit() { this.onChange(); }
   directorEngine() {
     return this.store.meta('directorEngine') === 'codex' ? 'codex' : 'dsh';
   }
   workerEngine() {const value=this.store.meta('workerEngine');return ['dsh','codex','auto'].includes(value)?value:'dsh';}
+  codexModels() {
+    return {
+      director:this.store.meta('codex:model:director') || 'gpt-6.1-terra',
+      worker:this.store.meta('codex:model:worker') || 'gpt-6.1-sol',
+    };
+  }
+  setCodexModels({director,worker}={}) {
+    const models={director,worker};
+    for(const model of Object.values(models)){
+      if(typeof model!=='string'||!/^[a-z0-9][a-z0-9._-]{0,79}$/iu.test(model))throw Error('请选择模型，或输入有效的 Codex 模型标识');
+    }
+    this.store.transaction(()=>{
+      const previous=this.codexModels();
+      for(const [role,model] of Object.entries(models))this.store.meta(`codex:model:${role}`,model);
+      this.store.event(null,'codex.models-changed',{from:previous,to:models});
+    });
+    this.emit();return this.codexModels();
+  }
   setWorkerEngine(engine) {
     if(!['dsh','codex','auto'].includes(engine))throw Error('请选择 DSH、Codex 或自动选择');
     if(engine!=='auto'&&!this.adapters[engine]?.start)throw Error('所选任务引擎当前未接入');
@@ -164,6 +179,7 @@ export class Hub {
       this.companion?.syncHandoff(payload);
     }
     this.store.meta('directorEngine',engine);
+    if(previous==='codex')this.adapters.codex?.releaseIdleDirector?.();
     this.store.event(null,'director.engine-changed',{from:previous,to:engine,continuityPending:!!previousSession});
     this.emit();
     return {engine,changed:true,continuityPending:!!previousSession};
@@ -181,17 +197,25 @@ export class Hub {
     catch { /* An optional health observer must never block task delivery. */ }
   }
   fixedWorkerPool() {
-    return Object.keys(this.adapters).flatMap(engine=>Array.from({length:fixedWorkerSlotCount(engine)},(_,index)=>{
+    if(!this.fixedWorkers)return [];
+    return Object.keys(this.adapters).flatMap(engine=>Array.from({length:fixedWorkerSlotCount(engine)+(engine==='dsh'?1:0)},(_,index)=>{
       const slot=index+1,context=fixedWorkerContext({store:this.store,engine,workspaceRoot:this.workspaceRoot,slot});
-      const loads=this.store.db.prepare(`SELECT status,COUNT(*) n FROM tasks t WHERE role='worker' AND engine=? AND cwd=? AND status IN ('queued','running','waiting')
-        AND EXISTS(SELECT 1 FROM events e WHERE e.taskId=t.id AND e.type='task.fixed-worker') GROUP BY status`).all(engine,context.cwd);
-      const count=status=>loads.find(x=>x.status===status)?.n||0;
+      const activeTasks=this.store.db.prepare(`SELECT id,status,prompt FROM tasks t WHERE role='worker' AND engine=? AND cwd=? AND status IN ('queued','running','waiting')
+        AND EXISTS(SELECT 1 FROM events e WHERE e.taskId=t.id AND e.type='task.fixed-worker')
+        ORDER BY CASE status WHEN 'waiting' THEN 0 WHEN 'running' THEN 1 ELSE 2 END,createdAt,rowid`).all(engine,context.cwd);
+      const count=status=>activeTasks.filter(task=>task.status===status).length;
       const previous=context.sourceTaskId?this.store.task(context.sourceTaskId):null;
-      return {engine,slot,name:`${dispatchEngineName(engine)} · 固定工作会话${slot>1?` ${slot}`:''}`,hasSession:!!context.sessionId,
-        busy:loads.length>0,running:count('running')+count('waiting'),queued:count('queued'),
+      const task=activeTasks[0]||previous;
+      return {engine,slot,name:slot===4?'DSH · 手机专用会话':`${dispatchEngineName(engine)} · 固定工作会话${fixedWorkerSlotCount(engine)>1?` ${slot}`:''}`,hasSession:!!context.sessionId,
+        ...(engine==='codex'?{model:this.codexModels().worker}:{}),
+        busy:activeTasks.length>0,running:count('running')+count('waiting'),waiting:count('waiting'),queued:count('queued'),
+        task:task?{id:task.id,status:task.status,topic:redact(task.prompt).replace(/\s+/g,' ').slice(0,120)}:null,
         lastTopic:previous?redact(previous.prompt).replace(/\s+/g,' ').slice(0,100):'',
-        sessionUrl:engine==='dsh'&&context.sessionId&&previous?`/api/tasks/${encodeURIComponent(previous.id)}/session`:null};
+        sessionUrl:engine==='dsh'&&context.sessionId&&previous?.sessionId===context.sessionId?`/api/tasks/${encodeURIComponent(previous.id)}/session`:null};
     }));
+  }
+  usesPhoneSeat(task) {
+    return task.engine==='dsh'&&fixedWorkerSlotForTask(task,this.workspaceRoot)===4;
   }
   fixedWorkerUsage(context) {
     if(!context?.sessionId) return 0;
@@ -227,6 +251,18 @@ export class Hub {
     }catch{return null;}
   }
   isFixedWorker(task) {return !!task?.id&&!!this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.fixed-worker'").get(task.id);}
+  async continuationTarget(parent,handoff,userText){
+    let context={...(handoff||{})};
+    if(independentRequest(userText)){delete context.previousWork;delete context.nativeContinuationTargets;delete context.continuationCandidates;if(context.requestedSession?.source!=='explicit-user-session'&&context.requestedSession?.source!=='user-choice')delete context.requestedSession;}
+    const previous=context.previousWork?.taskId?this.store.task(context.previousWork.taskId):null;
+    if(!context.requestedSession&&!context.nativeContinuationTargets?.length&&continuationRequested(userText)&&parent?.id){
+      const verified=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='director.native-session-verified' ORDER BY id DESC LIMIT 10").all(parent.id).flatMap(row=>{try{return [JSON.parse(row.data)];}catch{return [];}}).filter(target=>target.scope==='local');
+      if(verified.length)context.nativeContinuationTargets=verified.map(target=>({...target,source:'verified-current-native-read'}));
+    }
+    if(!context.requestedSession&&!context.nativeContinuationTargets?.length&&previous?.sessionId&&!this.isFixedWorker(previous)&&continuationRequested(userText))context.nativeContinuationTargets=[{engine:previous.engine,sessionId:previous.sessionId,cwd:previous.cwd,title:this.sessionTitleForTask(previous),source:'canonical-task-continuation',taskId:previous.id}];
+    try{return await resolveSessionContinuation({store:this.store,nativeSessions:this.nativeSessions,nativeTasks:this.nativeTasks,caller:parent,userText,handoff:context,repairIds:[this.codexRepairThreadId,this.codexAutoRepairThreadId]});}
+    catch(error){if(isSessionContinuationError(error)&&parent?.id)this.store.event(parent.id,'director.continuation-blocked',{code:error.code,message:error.message,candidates:error.candidates,userRequest:userText});throw error;}
+  }
   kickCoordinator() {
     if(this.stopping||this.store.db.prepare("SELECT 1 FROM tasks WHERE role='coordinator' AND status IN ('running','waiting') LIMIT 1").get())return;
     const task=this.store.db.prepare("SELECT * FROM tasks WHERE role='coordinator' AND status='queued' ORDER BY createdAt,rowid LIMIT 1").get();
@@ -266,11 +302,32 @@ export class Hub {
     return records;
   }
   report(task,key) {if(this.reports)this.reports.enqueue(task,key);else {this.say(task.result || '这项任务没有完成。');this.notification(task.result || '这项任务没有完成。',key);}}
-  async create({engine='dsh',prompt,model,messageKey,role='worker',project,sessionId:requestedSessionId,workerSlot,contextTaskId,nativeSession,imagePaths=[],imageCleanupDirectory,handoff,originalUserText,requestContext,siblingDispatch=false}) {
+  async create({engine='dsh',prompt,model,messageKey,role='worker',project,sessionId:requestedSessionId,workerSlot,pinFixedWorker=false,contextTaskId,nativeSession,imagePaths=[],imageCleanupDirectory,handoff,originalUserText,requestContext,siblingDispatch=false}) {
     const directorRequest=typeof messageKey==='string'?/^(?:director|coordinator):(t-[\w-]+):[a-f0-9]{24}$/.exec(messageKey):null;
     const parent=directorRequest && this.store.task(directorRequest[1]);
+    const suppliedNativeSession=!!nativeSession;
+    const duplicate=messageKey?this.store.task('t-'+createHash('sha256').update(messageKey).digest('hex').slice(0,12)):null;if(duplicate)return duplicate;
+    let inherited=handoff||this.workHandoff(parent);
+    const userRequest=inherited?.userRequest||parent?.prompt||prompt;
+    const pinnedSeat=pinFixedWorker?{engine,slot:workerSlot}:parent&&role==='worker'&&!nativeSession?requestedFixedWorker(userRequest):null;
+    if(pinnedSeat){
+      if(!this.fixedWorkers||role!=='worker'||nativeSession||!Number.isInteger(pinnedSeat.slot))throw Error('请选择可用的固定工作席位');
+      engine=pinnedSeat.engine;
+      if(!pinFixedWorker){
+        project=undefined;requestedSessionId=undefined;model=undefined;
+        if(!contextTaskId&&inherited){inherited={...inherited};delete inherited.previousWork;delete inherited.requestedSession;}
+      }
+      if(project||requestedSessionId)throw Error('固定席位与指定项目或原生会话不能同时提交');
+    }
+    if(parent&&role==='worker'&&!nativeSession&&!pinnedSeat){
+      if(contextTaskId){const reference=buildWorkHandoff({store:this.store,userText:userRequest,goal:prompt,sourceTaskId:contextTaskId});if(!reference.previousWork)throw Error('指定的前次任务记录不存在或不可用于续接');inherited={...inherited,...reference};}
+      const target=await this.continuationTarget(parent,inherited,userRequest);
+      if(target){inherited={...inherited,requestedSession:target};if(role==='coordinator')handoff=inherited;else{nativeSession=target;engine=target.engine;requestedSessionId=target.sessionId;model=undefined;}}
+      else if(independentRequest(userRequest)){inherited={...inherited};delete inherited.previousWork;delete inherited.requestedSession;delete inherited.nativeContinuationTargets;delete inherited.continuationCandidates;if(role==='coordinator')handoff=inherited;}
+    }
+    if(suppliedNativeSession&&parent&&this.nativeSessions){const target=await this.continuationTarget(parent,{requestedSession:nativeSession},userRequest);if(target.engine!==nativeSession.engine||target.sessionId!==nativeSession.sessionId)throw Error('本轮明确会话与请求目标不一致，请核对目标');nativeSession=target;engine=target.engine;requestedSessionId=target.sessionId;}
     if(role==='coordinator') {engine='dsh';model=null;}
-    if(['director','coordinator'].includes(parent?.role)&&role==='worker'&&!nativeSession) {
+    if(['director','coordinator'].includes(parent?.role)&&role==='worker'&&!nativeSession&&!pinnedSeat) {
       const inheritedWork=this.workHandoff(parent),originalRequest=inheritedWork?.userRequest||parent.prompt;
       const previous=contextTaskId?this.store.task(contextTaskId):inheritedWork?.previousWork?.taskId?this.store.task(inheritedWork.previousWork.taskId):null;
       const continuationEngine=previous?.role==='worker'&&Object.hasOwn(this.adapters,previous.engine)?previous.engine:null;
@@ -286,7 +343,7 @@ export class Hub {
       }
     }
     if(typeof engine!=='string' || !Object.hasOwn(this.adapters,engine) || typeof this.adapters[engine]?.start!=='function') throw Error('请选择已接入的 dsh、codex 或 workbuddy 引擎');
-    if(engine==='codex' && !model&&!nativeSession)model=this.codexDefaultModel;
+    if(engine==='codex' && !model&&!nativeSession)model=this.codexModels()[role==='director'?'director':'worker'];
     if(engine==='workbuddy' && !model&&!nativeSession)model=this.workbuddyDefaultModel;
     if(typeof prompt!=='string' || !prompt.trim() || prompt.length>20000) throw Error('任务内容需要 1–20000 个字符');
     const id='t-'+(messageKey?createHash('sha256').update(messageKey).digest('hex').slice(0,12):randomUUID().slice(0,8));
@@ -298,27 +355,23 @@ export class Hub {
       const linked=linkedSupervisorTask(this,parent);
       if(linked&&!nativeSession&&!(siblingDispatch&&parent.role==='director'&&role==='coordinator'))return linked;
     }
-    const phoneResourceTask=role==='worker'&&requiresPhoneResource(`${parent?.prompt||''}\n${prompt}`);
-    const phoneResourceBusy=phoneResourceTask&&this.store.db.prepare("SELECT prompt FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting') ORDER BY createdAt").all().some(row=>requiresPhoneResource(row.prompt));
+    const phoneResourceTask=role==='worker'&&(pinnedSeat?.slot===4||requiresPhoneResource(`${userRequest}\n${prompt}`));
+    if(pinnedSeat&&phoneResourceTask&&(engine!=='dsh'||pinnedSeat.slot!==4))throw Error('手机操作请选择 DSH 手机专用会话');
+    const phoneResourceBusy=phoneResourceTask&&this.store.db.prepare("SELECT engine,cwd,prompt FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").all().some(row=>this.usesPhoneSeat(row)||requiresPhoneResource(row.prompt));
     const executionCount=this.store.db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").get().n;
     const capacityBusy=role==='worker'&&executionCount>=this.maxConcurrent;
-    let inherited=handoff||this.workHandoff(parent);
     if(contextTaskId&&parent){
       const reference=buildWorkHandoff({store:this.store,userText:inherited?.userRequest||parent.prompt,goal:prompt,sourceTaskId:contextTaskId});
       if(!reference.previousWork)throw Error('指定的前次任务记录不存在或不可用于续接');
       inherited={...inherited,...reference};
     }
     const original=inherited?.userRequest||parent?.prompt||prompt;
-    if(role==='coordinator'&&handoff&&/(?:会话|对话)/u.test(original)&&this.nativeTasks?.listSessions) {
-      const named=(await this.nativeTasks.listSessions()).filter(item=>item.title?.length>=2&&original.includes(item.title));
-      if(named.length===1)handoff={...handoff,requestedSession:{sessionId:named[0].sessionId,title:named[0].title,cwd:named[0].cwd}};
-    }
-    if(role==='worker'&&this.fixedWorkers&&parent&&!nativeSession) {
+    if(role==='worker'&&this.fixedWorkers&&parent&&!nativeSession&&!pinnedSeat) {
       // A model-suggested project/session is not a user override.
       if(project&&!original.includes(project))project=undefined;
-      if(requestedSessionId&&!/(?:会话|对话|session)/iu.test(original))requestedSessionId=undefined;
+      if(requestedSessionId&&!original.includes(requestedSessionId)&&inherited?.requestedSession?.sessionId!==requestedSessionId)requestedSessionId=undefined;
       if(inherited?.requestedSession) {
-        if(engine!=='dsh')throw Error('用户指定的会话属于 DSH，不能交给其他引擎。');
+        if(engine!==inherited.requestedSession.engine)throw Error('当前执行引擎与已核验原会话不一致，请核对选择。');
         nativeSession=inherited.requestedSession;requestedSessionId=nativeSession.sessionId;
       }
     }
@@ -329,14 +382,15 @@ export class Hub {
       if(previous?.role==='worker'&&previous.engine===engine&&previous.sessionId&&(!project||project===previousProject)) {
         const slot=fixedWorkerSlotForTask(previous,this.workspaceRoot);
         const seat=fixedWorkerContext({store:this.store,engine,workspaceRoot:this.workspaceRoot,slot});
-        if(this.fixedWorkers&&this.isFixedWorker(previous)&&resolve(seat.cwd).toLowerCase()===resolve(previous.cwd).toLowerCase())fixedContinuation=previous;
-        else if(['completed','failed','cancelled','interrupted'].includes(previous.status)){
+        if(this.fixedWorkers&&this.isFixedWorker(previous)&&resolve(seat.cwd).toLowerCase()===resolve(previous.cwd).toLowerCase()&&(!pinnedSeat||slot===pinnedSeat.slot))fixedContinuation=previous;
+        else if(!pinnedSeat&&['completed','failed','cancelled','interrupted'].includes(previous.status)){
           requestedSessionId=previous.sessionId;resumeTaskId=previous.id;
         }
       }
     }
     const fixed=role==='worker'&&this.fixedWorkers&&!nativeSession&&!requestedSessionId&&!(project&&(!parent||original.includes(project)));
-    const fixedContext=fixed?(fixedContinuation?fixedWorkerContext({store:this.store,engine,workspaceRoot:this.workspaceRoot,slot:fixedWorkerSlotForTask(fixedContinuation,this.workspaceRoot)}):selectFixedWorkerContext({store:this.store,engine,workspaceRoot:this.workspaceRoot,preferredSlot:phoneResourceTask&&engine==='dsh'?4:workerSlot,prompt:original})):null;
+    const exactSlot=pinnedSeat?.slot??(fixedContinuation?fixedWorkerSlotForTask(fixedContinuation,this.workspaceRoot):null);
+    const fixedContext=fixed?(exactSlot?fixedWorkerContext({store:this.store,engine,workspaceRoot:this.workspaceRoot,slot:exactSlot}):selectFixedWorkerContext({store:this.store,engine,workspaceRoot:this.workspaceRoot,preferredSlot:phoneResourceTask&&engine==='dsh'?4:workerSlot,prompt:original})):null;
     let fixedRollover=null;
     if(fixedContext&&fixedContinuation){fixedContext.sessionId=fixedContinuation.sessionId;fixedContext.sourceTaskId=fixedContinuation.id;}
     if(fixed&&engine==='dsh'&&fixedContext?.sessionId) {
@@ -355,7 +409,7 @@ export class Hub {
       latestCompletedProjectWorker:(...args)=>this.latestCompletedProjectWorker(...args),
       latestRelatedWorker:(...args)=>this.latestRelatedWorker(...args),sessionIsRelevant:(...args)=>this.sessionIsRelevant(...args),reusableDshRoute:id=>this.reusableDshRoute(id)});
     const {cwd,projectName,continuedFrom,coordinatorSessionFallback,continuationRoute,continuationContext,continuedSessionId}=context;
-    let taskPrompt=prompt.trim();
+    let taskPrompt=nativeSession?(typeof originalUserText==='string'?originalUserText:nativeSession.originalRequest?`${nativeSession.originalRequest}\n${userRequest}`:nativeSession.verified?userRequest:prompt):prompt.trim();
     if(fixedRollover&&fixedContinuation) {
       const previous= fixedContinuation;
       const compact=[
@@ -377,17 +431,18 @@ export class Hub {
       const bounded=context.slice(0,budget);
       if(bounded)taskPrompt=`${bounded}\n\n本轮要求：\n${taskPrompt}`;
     }
-    mkdirSync(cwd,{recursive:true});
+    if(nativeSession?.verified){let info;try{info=await stat(cwd);}catch{throw Error('原生会话工作目录已不可用，保留原身份并核对；没有新建替代目录。');}if(!info.isDirectory())throw Error('原生会话工作目录不是目录');}
+    else mkdirSync(cwd,{recursive:true});
     const projectPath=role==='worker' ? null : this.directorProjectPath;
     const task=this.store.createTask({id,engine,prompt:taskPrompt,cwd,projectPath,model,role,sessionId:role==='director'?this.store.meta('directorSessionId'):role==='worker'?nativeSession?.sessionId || continuedSessionId || null:null});
     if(requestContext)this.store.event(id,'chat.request-context',{text:requestContext});
     if(role==='director'&&typeof originalUserText==='string')this.store.event(id,'chat.original',{text:originalUserText});
-    if(fixed)this.store.event(id,'task.fixed-worker',{engine,slot:fixedContext.slot});
+    if(fixed)this.store.event(id,'task.fixed-worker',{engine,slot:fixedContext.slot,...(pinnedSeat?{pinned:true}:{})});
     if(nativeSession)this.store.event(id,'task.native-session',{engine,sessionId:nativeSession.sessionId,title:nativeSession.title||nativeSession.sessionId,...(engine==='workbuddy'&&nativeSession.workbuddyConfigDir?{workbuddyConfigDir:nativeSession.workbuddyConfigDir}:{})});
     if(fixedRollover)this.store.event(id,'task.fixed-worker-rollover',{...fixedRollover,reason:'context-limit'});
     if(role==='coordinator')this.store.event(id,'task.fixed-dispatcher',{});
     if(parent&&['coordinator','worker'].includes(role)) {
-      const facts={...(inherited||buildWorkHandoff({store:this.store,userText:parent.prompt,goal:prompt})),executionEngine:nativeSession?engine:inherited?.executionEngine||this.workerEngine(),...(role==='worker'?{goal:taskPrompt}:{})};
+      const facts={...(inherited||buildWorkHandoff({store:this.store,userText:parent.prompt,goal:prompt})),executionEngine:nativeSession?engine:inherited?.requestedSession?.engine||inherited?.executionEngine||this.workerEngine(),...(role==='worker'?{goal:taskPrompt}:{})};
       this.store.event(id,'task.work-handoff',facts);
       if(role==='worker'&&facts.fileDelivery)this.store.event(id,'file-delivery.requested',{source:'supervisor',messageKey});
     }
@@ -417,20 +472,21 @@ export class Hub {
     if(this.stopping)return 0;
     let activeCount=this.store.db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").get().n;
     if(activeCount>=this.maxConcurrent)return 0;
-    const phoneRows=this.store.db.prepare("SELECT prompt FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").all();
-    let phoneBusy=phoneRows.some(row=>requiresPhoneResource(row.prompt));
+    const phoneRows=this.store.db.prepare("SELECT engine,cwd,prompt FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").all();
+    let phoneBusy=phoneRows.some(row=>this.usesPhoneSeat(row)||requiresPhoneResource(row.prompt));
     const queue=this.store.db.prepare("SELECT * FROM tasks AS queued WHERE queued.role='worker' AND queued.status='queued' AND NOT EXISTS (SELECT 1 FROM approvals WHERE approvals.taskId=queued.id AND approvals.status='recovery_required') AND NOT EXISTS (SELECT 1 FROM events WHERE events.taskId=queued.id AND events.type='task.native-linked') ORDER BY queued.createdAt,queued.rowid").all();
     let started=0;
     for(let task of queue) {
       if(activeCount>=this.maxConcurrent)break;
-      const phoneTask=requiresPhoneResource([task.prompt,...this.amendments.pending(task.id).map(row=>row.text)].join('\n'));
+      const phoneTask=this.usesPhoneSeat(task)||requiresPhoneResource([task.prompt,...this.amendments.pending(task.id).map(row=>row.text)].join('\n'));
       if(phoneTask&&phoneBusy)continue;
       if(this.isFixedWorker(task)) {
         const slot=fixedWorkerSlotForTask(task,this.workspaceRoot);
         if(fixedWorkerBusy({store:this.store,engine:task.engine,slot,workspaceRoot:this.workspaceRoot,excludingTaskId:task.id})){
           // Only never-started independent pool work can move. Follow-ups and
           // recovered work retain their original session and context.
-          if(this.workHandoff(task)?.previousWork||this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.started' LIMIT 1").get(task.id))continue;
+          const pinned=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.fixed-worker' AND json_extract(data,'$.pinned')=1 LIMIT 1").get(task.id);
+          if(pinned||this.workHandoff(task)?.previousWork||this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.started' LIMIT 1").get(task.id))continue;
           const idle=selectFixedWorkerContext({store:this.store,engine:task.engine,workspaceRoot:this.workspaceRoot});
           if(fixedWorkerHasPending({store:this.store,engine:task.engine,slot:idle.slot,workspaceRoot:this.workspaceRoot}))continue;
           mkdirSync(idle.cwd,{recursive:true});
@@ -461,7 +517,7 @@ export class Hub {
     const cwd=join(this.workspaceRoot,'_director');
     mkdirSync(cwd,{recursive:true});
     const engine=this.directorEngine();
-    const task=this.store.createTask({id,engine,prompt:'恢复主管会话：读取已合并的长期记忆，继续自然对话和任务分派。',cwd:engine==='codex'&&this.directorProjectPath?this.directorProjectPath:cwd,projectPath:this.directorProjectPath,role:'director',sessionId:null,model:engine==='codex'?this.codexDefaultModel:null});
+    const task=this.store.createTask({id,engine,prompt:'恢复主管会话：读取已合并的长期记忆，继续自然对话和任务分派。',cwd:engine==='codex'&&this.directorProjectPath?this.directorProjectPath:cwd,projectPath:this.directorProjectPath,role:'director',sessionId:null,model:engine==='codex'?this.codexModels().director:null});
     const payload=this.directorSnapshot(task,reason);
     const handoff=this.store.createDirectorHandoff({parentSessionId:previousSession || 'unknown',sourceTaskId:id,reason,payload,status:'starting'});
     this.store.linkDirectorHandoff(handoff.id,{targetTaskId:id,status:'starting'});
@@ -528,7 +584,7 @@ export class Hub {
         }
       }
       const sessionId=(pending || previousSessionEngine!==next.engine)?null:previousSession;
-      this.store.update(next.id,{sessionId,...(next.engine==='codex'&&!next.model?{model:this.codexDefaultModel}:{})});
+      this.store.update(next.id,{sessionId,...(next.engine==='codex'&&!next.model?{model:this.codexModels().director}:{})});
       if(pending) {
         this.store.linkDirectorHandoff(pending.id,{targetTaskId:next.id,status:'starting',attempts:pending.attempts});
         this.store.meta('directorHandoffPending','');
@@ -567,6 +623,7 @@ export class Hub {
       }finally{this.checkingDirector=false;}
     }else if(elapsed>=warningMs && !this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.wait-notified' AND COALESCE(json_extract(data,'$.runVersion'),1)=? LIMIT 1").get(task.id,task.runVersion)) {
       this.store.event(task.id,'director.wait-notified',{elapsedMs:elapsed,runVersion:task.runVersion});
+      if(this.workPresence?.settings().enabled){void this.workPresence.poll({preferredTask:task});return;}
       const retry=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='message' AND data LIKE '%model-retry%' LIMIT 1").get(task.id);
       const coordinator=linkedSupervisorTask(this,task);
       if(this.reports?.announce)void this.reports.announce({task:{...task,prompt:'仅告知主管回复仍在生成',result:'',progressNotice:{waitingSeconds:Math.floor(elapsed/1000),connectionRetry:!!retry,acceptedSessionName:coordinator?this.sessionTitleForTask(coordinator):null}},kind:'director-delay',dedupe:`director-wait:${task.id}:${task.runVersion}`,
@@ -644,7 +701,7 @@ export class Hub {
   }
   directorRequestedEngine(task) {
     const context=this.workHandoff(task);
-    const selected=context?.executionEngine||this.workerEngine();
+    const selected=context?.requestedSession?.engine||context?.executionEngine||this.workerEngine();
     return requestedEngine(context?.userRequest||task?.prompt)||(selected!=='auto'?selected:null);
   }
   requestsFreshSession(prompt) {
@@ -749,8 +806,9 @@ export class Hub {
     const director=task.role==='director';
     const projectSupervisor=director||task.role==='coordinator';
     const directorReport=director && String(prompt).startsWith('[内部工作回报]');
+    const codexConversation=director&&!directorReport&&task.engine==='codex';
     const documentPaths=projectSupervisor?this.companion?.documentPaths():null;
-    const documentRole=directorReport?'report':task.role;
+    const documentRole=directorReport?'report':director&&task.engine==='codex'?'codex-director':task.role;
     const documentKey=sessionId=>`session-documents:${task.engine}:${documentRole}:${sessionId}`;
     let loaded={};
     try { if(task.sessionId)loaded=JSON.parse(this.store.meta(documentKey(task.sessionId))||'{}'); } catch {}
@@ -762,13 +820,16 @@ export class Hub {
     // This path sends the exact user turn. Do not build a discarded synthetic
     // prompt or scan work/task/episode stores before ordinary native chat.
     const selectedNative=JSON.parse(this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='task.native-session' ORDER BY id DESC LIMIT 1").get(task.id)?.data||'null');
+    const codexFixedWorker=task.engine==='codex'&&task.role==='worker'&&this.isFixedWorker(task);
+    const persona=projectSupervisor&&!nativeConversation?this.companion?.state?.().persona:undefined;
     const built=selectedNative?{text:prompt}:nativeConversation?{text:originalUserText}:buildTaskPrompt({task,prompt,engines:Object.keys(this.adapters),
-      sessionDocuments:documentPaths?documents.text:undefined,
+      sessionDocuments:documentPaths?(codexConversation?'':documents.text):undefined,
       documentPaths,
-      persona:projectSupervisor?this.companion?.state?.().persona:undefined,
+      persona,
       companionGuide:director && !directorReport?this.companion?.guide?.(task.prompt,{maxChars:450,factsOnly:true}):'',
       behaviorPolicy:director&&!directorReport?this.companion?.behaviorSettings?.():null,
       taskContext:()=>this.currentTaskContext({routing:task.role==='coordinator',compact:director,prompt:task.prompt}),
+      codexFixedWorker,
       // The persistent first-level supervisor already has its own chat history
       // and project documents. Injecting task retrieval here turns a user turn
       // into a long, synthetic message; task history belongs on the dispatch
@@ -787,7 +848,19 @@ export class Hub {
     let imagePaths=[],imageCleanupDirectory=null;
     if(task.engine==='dsh'&&!(task.sessionId&&carried.length))try{const row=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='task.images' ORDER BY id DESC LIMIT 1").get(task.id);const saved=JSON.parse(row?.data||'{}');imagePaths=saved.paths||[];imageCleanupDirectory=saved.cleanupDirectory||null;}catch{}
     const cleanupImages=()=>this.cleanupVisualCache(imageCleanupDirectory);
+    const codexProjectRole=codexConversation?'director':codexFixedWorker?'workers':null;
+    const codexProjectId=codexProjectRole?this.store.meta(`codex:project:${codexProjectRole}`):null;
+    const codexContext=codexConversation?[
+      built.sessionContext,
+      this.companion?.expressionGuide?.(originalUserText||task.prompt),
+      !task.sessionId?recentNativeContinuity(this.store,originalUserText||task.prompt):'',
+      directorRequestReferences(JSON.parse(this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='chat.request-context' ORDER BY id DESC LIMIT 1").get(task.id)?.data||'{}').text||'',notificationContext(this.store,originalUserText||task.prompt)),
+      documents.text,
+    ].filter(Boolean).join('\n\n').slice(0,12000):'';
     const adapterTask={...task,prompt:instruction,displayTitle:this.sessionTitleForTask(task),imagePaths,
+      ...(codexContext?{codexContext}:{}),
+      ...(codexConversation?{codexPersona:codexDirectorPersona(persona)}:{}),
+      ...(codexProjectId?{codexProjectId,codexThreadName:codexConversation?'Codex · 对话主管':this.sessionTitleForTask(task)}:{}),
       ...(selectedNative?{preserveNativeSession:true}:{}),
       ...(selectedNative?.workbuddyConfigDir?{workbuddyConfigDir:selectedNative.workbuddyConfigDir}:{}),
       ...(typeof originalUserText==='string'?{userText:originalUserText}:{}),
@@ -837,7 +910,7 @@ export class Hub {
         if(!preserveSession&&task.status==='interrupted')readyTask=this.store.update(task.id,{sessionId:slot.sessionId});
       }
       if(this.store.db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").get().n>=this.maxConcurrent) break;
-      if(requiresPhoneResource(task.prompt) && this.store.db.prepare("SELECT prompt FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").all().some(row=>requiresPhoneResource(row.prompt)))continue;
+      if((this.usesPhoneSeat(task)||requiresPhoneResource(task.prompt)) && this.store.db.prepare("SELECT engine,cwd,prompt FROM tasks WHERE role NOT IN ('director','coordinator') AND status IN ('running','waiting')").all().some(row=>this.usesPhoneSeat(row)||requiresPhoneResource(row.prompt)))continue;
       try {
         const reconnect=task.status==='interrupted';
         const previousResume=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='task.auto-resume' ORDER BY id DESC LIMIT 1").get(task.id);
@@ -917,6 +990,13 @@ export class Hub {
       this.scheduleAmendmentContinuation(id);this.emit();return;
     }
     if(event.type==='progress') {
+      if(task.role==='director'&&event.kind==='steer-received'&&typeof event.requestId==='string') {
+        this.store.event(id,'dsh.steer-received',{requestId:event.requestId});
+        const pending=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='director.interjection-uncertain' AND json_extract(data,'$.requestId')=?").get(id,event.requestId);
+        if(pending)this.recordDirectorInterjection(task,JSON.parse(pending.data));
+        return;
+      }
+      if(event.kind==='preflight-timing')this.store.event(id,'dsh.preflight',{stage:event.stage,method:event.method,durationMs:event.durationMs});
       if(['prompt-submitting','prompt-received','model-started'].includes(event.kind))this.store.event(id,'dsh.'+event.kind,{kind:event.kind});
       // Progress contains no engine payload. Persist only a coarse DSH tool
       // activity marker so recovered tool-runtime failures can be verified.
@@ -1024,6 +1104,7 @@ export class Hub {
       const documents=this.sessionDocumentLoads.get(id);
       if(documents&&task.sessionId)this.store.meta(`session-documents:${task.engine}:${documents.role}:${task.sessionId}`,JSON.stringify(documents.fingerprints));
       this.sessionDocumentLoads.delete(id);
+      if(task.role==='director'&&!String(event.text||'').trim())return this.fail(id,Error('对话引擎结束但没有可见回复，原请求已保留；没有把空结果当作完成。'));
       let text=String(event.text || task.result || '任务已结束。');
       if(task.role==='director'&&(text.match(/\[HUB-DISPATCH\]/g)||[]).length>1){
         const previous=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.multi-dispatch-repair'").get(id);
@@ -1034,6 +1115,8 @@ export class Hub {
         }
       }
       await publishSupervisorProgress(this,task,text);
+      const blockedContinuation=task.role==='director'?this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='director.continuation-blocked' ORDER BY id DESC LIMIT 1").get(id):null;
+      if(blockedContinuation&&!linkedSupervisorTask(this,task))text=JSON.parse(blockedContinuation.data).message;
       if(task.role==='director')text=stripSupervisorAck(text);
       const frontdeskOnly=task.role==='director' && String(task.prompt||'').startsWith('[前台回应]');
       if(frontdeskOnly && /^\s*\[HUB-/m.test(text)) {
@@ -1043,7 +1126,7 @@ export class Hub {
       if(task.role==='director'&&!directorReport&&!frontdeskOnly&&text.includes('[HUB-AMEND]')) {
         const parsed=parseProtocolObject(text,'[HUB-AMEND]');
         const reply=typeof parsed.value.reply==='string'?parsed.value.reply.trim().slice(0,600):'';
-        text=[text.slice(0,text.indexOf('[HUB-AMEND]')),reply,'补充已记录，会在原工作会话安全接续。',text.slice(parsed.end)].filter(Boolean).join('\n').trim();
+        text=[text.slice(0,text.indexOf('[HUB-AMEND]')),reply,text.slice(parsed.end)].filter(Boolean).join('\n').trim();
       }
       let chatPlan=null;
       if(task.role==='director' && !directorReport && !frontdeskOnly && text.trim().startsWith('[HUB-CHAT]')) {
@@ -1080,27 +1163,36 @@ export class Hub {
         text=lines.filter(line=>!line.trim().startsWith('[HUB-FILES]')).join('\n').trim();
       }
       if(task.role==='coordinator') {
+        const recordedAmendment=this.store.db.prepare('SELECT taskId FROM task_amendments WHERE idempotencyKey=?').get('fixed-seat-amend:'+id);
         // Legacy native-tool dispatches are recorded asynchronously. Reconcile
         // them before coordinator fallback so it cannot create a duplicate.
-        const needsNativeCheck=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='dsh.tool-activity' LIMIT 1").get(id);
+        const needsNativeCheck=!recordedAmendment&&!linkedSupervisorTask(this,task)&&this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='dsh.tool-activity' LIMIT 1").get(id);
         const nativeChecked=needsNativeCheck&&this.nativeTasks ? await this.nativeTasks.poll({fresh:true}) : true;
         if(!nativeChecked)throw Error('暂时无法核对 DSH 原生派单记录，已暂停协调器补派以避免重复执行。');
         const workerEvent=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='director.worker-created' ORDER BY id DESC LIMIT 1").get(id);
         let workerId=null;try{workerId=JSON.parse(workerEvent?.data||'{}').workerId;}catch{}
-        const directivePositions=[...text.matchAll(/\[HUB-DISPATCH\]/g)];
+        const toolResult=workerId||recordedAmendment?null:orchestrationResult(this.store,task,text);
+        const directivePositions=workerId||recordedAmendment?[]:[...text.matchAll(/\[HUB-DISPATCH\]/g)];
         if(directivePositions.length>1)return this.fail(id,Error('二级协调输出了多条派单，已阻止重复执行。'));
         if(directivePositions.length===1 && !workerId) {
           let request,directiveEnd;
           try{const parsed=parseProtocolObject(text,'[HUB-DISPATCH]');request=parsed.value;directiveEnd=parsed.end;}catch{throw Error('二级协调派单格式无效');}
-          if(!request||Array.isArray(request)||Object.keys(request).some(key=>!['engine','prompt','project','sessionId','workerSlot','contextTaskId'].includes(key))||typeof request.engine!=='string'||!Object.hasOwn(this.adapters,request.engine)||typeof request.prompt!=='string'||!request.prompt.trim()||request.prompt.length>20000||(request.project!==undefined&&(typeof request.project!=='string'||request.project.length>100))||(request.sessionId!==undefined&&typeof request.sessionId!=='string')||(request.contextTaskId!==undefined&&(typeof request.contextTaskId!=='string'||request.contextTaskId.length>80))||(request.workerSlot!==undefined&&(!Number.isInteger(request.workerSlot)||request.workerSlot<1||request.workerSlot>3)))throw Error('二级协调派单缺少有效引擎或执行要求');
+          if(!request||Array.isArray(request)||Object.keys(request).some(key=>!['engine','prompt','project','sessionId','workerSlot','contextTaskId'].includes(key))||typeof request.engine!=='string'||!Object.hasOwn(this.adapters,request.engine)||typeof request.prompt!=='string'||!request.prompt.trim()||request.prompt.length>20000||(request.project!==undefined&&(typeof request.project!=='string'||request.project.length>100))||(request.sessionId!==undefined&&typeof request.sessionId!=='string')||(request.contextTaskId!==undefined&&(typeof request.contextTaskId!=='string'||request.contextTaskId.length>80)))throw Error('二级协调派单缺少有效引擎或执行要求');
+          if(request.workerSlot!==undefined&&!isFixedWorkerSlot(request.engine,request.workerSlot))throw Error('派单指定的席位在所选引擎上不可用');
           const requestedEngine=this.directorRequestedEngine(task);
-          if(requestedEngine)request.engine=requestedEngine;
+          if(requestedEngine&&request.engine!==requestedEngine){request.engine=requestedEngine;request.workerSlot=undefined;}
           const workerPrompt=request.prompt.trim();
           const messageKey='coordinator:'+id+':'+createHash('sha256').update(request.engine+'\0'+workerPrompt+'\0'+(request.project||'')+'\0'+(request.sessionId||'')).digest('hex').slice(0,24);
           let images=[];try{const saved=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='task.images' ORDER BY id DESC LIMIT 1").get(id);images=JSON.parse(saved?.data||'{}').paths||[];}catch{}
-          await this.create({engine:request.engine,prompt:workerPrompt,messageKey,project:request.project,sessionId:request.sessionId,workerSlot:request.workerSlot,contextTaskId:request.contextTaskId,imagePaths:images});
-          text=text.slice(0,directivePositions[0].index)+text.slice(directiveEnd);
-        } else if(!workerId) {
+          try{
+            await this.create({engine:request.engine,prompt:workerPrompt,messageKey,project:request.project,sessionId:request.sessionId,workerSlot:request.workerSlot,contextTaskId:request.contextTaskId,imagePaths:images});
+            text=text.slice(0,directivePositions[0].index)+text.slice(directiveEnd);
+          }catch(error){
+            if(!isSessionContinuationError(error))throw error;
+            this.store.event(id,'coordinator.result-verified',{kind:'question',code:error.code});
+            text=JSON.stringify({kind:'question',summary:error.message,candidates:error.candidates,businessCompletion:false});
+          }
+        } else if(!workerId&&!toolResult&&!recordedAmendment) {
           const retries=this.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE taskId=? AND type='coordinator.dispatch-retry'").get(id).n;
           if(retries===0) {
             this.store.event(id,'coordinator.dispatch-retry',{reason:'coordinator did not create a worker'});
@@ -1114,19 +1206,11 @@ export class Hub {
         const latestWorkerEvent=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='director.worker-created' ORDER BY id DESC LIMIT 1").get(id);
         try{workerId=JSON.parse(latestWorkerEvent?.data||'{}').workerId;}catch{}
         const worker=workerId?this.store.task(workerId):null;
-        if(worker)text=`已交由会话「${this.sessionTitleForTask(worker)}」处理。`;
+        if(worker)text=worker.status==='queued'?`已在「${this.sessionTitleForTask(worker)}」排队。`:`已提交给「${this.sessionTitleForTask(worker)}」。`;
+        else if(recordedAmendment)text='补充已记录在原任务，执行结果由原任务回报。';
+        else if(toolResult)text=toolResult;
       }
       if(task.role==='director' && !directorReport && !frontdeskOnly) {
-        const remoteRequired=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.remote-tool-required'").get(id);
-        const remotePerformed=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.remote-operation'").get(id);
-        if(remoteRequired&&!remotePerformed){
-          const retried=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.remote-tool-retry'").get(id);
-          if(retried)return this.fail(id,Error('远端原会话操作尚未提交；没有改派本机工作会话。'));
-          this.store.event(id,'director.remote-tool-retry',{});
-          this.run(task,'刚才没有创建本机任务。请直接调用 hub_native_session，scope=remote，先 devices/list 再 read/message；使用已确认的远端电脑、引擎和原会话，不输出 HUB-DISPATCH，不转本机工作池。接收凭据与执行完成分别说明。');
-          return;
-        }
-
         // Reconcile native DSH dispatches before creating a secondary coordinator.
         const directives=supervisorDispatches(text);
         const needsNativeCheck=!directives.length&&!linkedSupervisorTask(this,task)&&this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='dsh.tool-activity' LIMIT 1").get(id);
@@ -1155,6 +1239,7 @@ export class Hub {
         const delegated=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.worker-created' LIMIT 1").get(id);
         const claimsDelegation=/(?:派出(?:去|了|查)?|已派发|已经派|派发完成|让那边(?:去|帮你)|交给.{0,12}(?:查|做|处理|下载|核实)|结果回来告诉你)/u.test(text);
         const amended=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.amended' LIMIT 1").get(id);
+        const remotePerformed=this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.remote-operation' LIMIT 1").get(id);
         if(!delegated && !amended && !remotePerformed && claimsDelegation) {
           if(!nativeChecked)throw Error('暂时无法核对 DSH 原生派单记录，已暂停补派以避免重复执行；连接恢复后会自动接收任务回报。');
           const engine=this.directorRequestedEngine(task) || 'dsh';
@@ -1191,7 +1276,7 @@ export class Hub {
           if(!rel || rel==='..' || rel.startsWith('..'+sep) || isAbsolute(rel) || !(await stat(absolute)).isFile())throw Error('引擎产物回执路径无效或越界');
         }
         text=text.split(/\r?\n/).filter(line=>line!==receiptLine).join('\n').trim() || receipt.summary || '任务完成。';
-      }else if(task.role!=='director' && /未能(?:完成|创建|写入)|无法(?:完成|创建|写入|读回验证)|没有完成|尚未写入|unable to (?:complete|create|write)|could not (?:complete|create|write)/i.test(text)) {
+      }else if(task.role!=='director' && !(task.role==='coordinator'&&this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='coordinator.result-verified' LIMIT 1").get(id)) && /未能(?:完成|创建|写入)|无法(?:完成|创建|写入|读回验证)|没有完成|尚未写入|unable to (?:complete|create|write)|could not (?:complete|create|write)/i.test(text)) {
         this.store.update(id,{result:text});return this.fail(id,Error('引擎本轮已结束，但原任务未完成：'+text.slice(-600)));
       }
       this.store.transaction(()=>{
@@ -1226,6 +1311,7 @@ export class Hub {
         const worker=workerId?this.store.task(workerId):null;
         const result=worker?(worker.status==='queued'?`任务已登记，正在等待执行席位；计划由会话「${this.sessionTitleForTask(worker)}」处理。`:`任务已交由会话「${this.sessionTitleForTask(worker)}」接手。`):'协调会话已完成。';
         this.store.event(id,'task.dispatch-hint',{text:result,sessionName:worker?this.sessionTitleForTask(worker):null});
+        if(!worker&&this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='coordinator.result-verified' LIMIT 1").get(id))this.report(this.store.task(id),'completed:'+id+':'+task.runVersion);
       }
       else if(task.role==='worker') {
         if(this.amendments.hasPending(id)){this.scheduleAmendmentContinuation(id);this.emit();return;}
@@ -1237,6 +1323,7 @@ export class Hub {
           this.report({...current,result:outcome.summary,fileDelivery:outcome},'completed:'+id+':'+task.runVersion);
         } else this.report(this.store.task(id),'completed:'+id+':'+task.runVersion);
       }
+      if(task.role==='director')this.notifyUnconfirmedInterjections(id);
       void this.notify();this.kickDirector();
     } else if(event.type==='failed')await this.fail(id,Object.assign(new Error(typeof event.error==='string'?event.error:JSON.stringify(event.error)),{retrySafe:event.retrySafe===true,
       ...(Number.isInteger(event.httpStatus)?{httpStatus:event.httpStatus}:{}),...(Number.isFinite(event.retryAfterMs)?{retryAfterMs:event.retryAfterMs}:{}),...(event.uncertain===true?{uncertain:true}:{})}));
@@ -1266,7 +1353,7 @@ export class Hub {
       this.store.update(id,{status:'failed',error:error.message});this.store.error(id,error.message);
       this.store.event(id,'task.failure-diagnostic',taskFailureDiagnostic(error));
       const plan=errorStrategy(error);this.store.event(id,'task.error-strategy',{category:plan.category,action:plan.action,httpStatus:plan.status,autoRetry:false});
-      if(task.role!=='director')this.store.collection(id,'pending');
+      if(!['director','coordinator'].includes(task.role))this.store.collection(id,'pending');
     });
     // Route actionable failures to the dedicated Codex repair project
     // internally. This is fire-and-forget and never blocks the failed task's
@@ -1278,6 +1365,7 @@ export class Hub {
     this.store.db.prepare("UPDATE approvals SET status='interrupted',updatedAt=? WHERE taskId=? AND status IN ('pending','resolving')").run(this.store.now(),id);
     if(task.role==='worker')await this.collect(task);
     if(task.role==='director'){
+      this.notifyUnconfirmedInterjections(id);
       const directorReport=String(task.prompt||'').startsWith('[内部工作回报]');
       let progressReport=false;try{progressReport=directorReport && JSON.parse(String(task.prompt).slice('[内部工作回报]\n'.length).split(/\r?\n/,1)[0]).kind==='progress';}catch{}
       // A failed report turn can leave DSH's writer attached to its session
@@ -1292,7 +1380,7 @@ export class Hub {
       if(!recovered){
         if(progressReport){this.emit();this.kickDirector();return;}
         const connection=/DSH RPC (?:workspace\/create|session\/create)|connecting to the DSH event stream/i.test(error.message);
-        const text=error.code==='DIRECTOR_REPLY_TIMEOUT'?'刚才那条回复卡住了，我已保留原消息并恢复后续对话。':connection?'刚才接入原对话时没有成功，这条还没能进入正常回复。你的消息和记忆都已保留。':'刚才这条回复没有完成。你的消息和记忆都已保留，具体原因已记录。';
+        const text=task.engine==='codex'&&codexWriterBusy(error)?'这条 Codex 会话还被另一端占用，刚才那句话没交给模型。我先把它留在中枢。':error.code==='DIRECTOR_REPLY_TIMEOUT'?'刚才那条回复卡住了，我已保留原消息并恢复后续对话。':connection?'刚才接入原对话时没有成功，这条还没能进入正常回复。你的消息和记忆都已保留。':'刚才这条回复没有完成。你的消息和记忆都已保留，具体原因已记录。';
         this.say(text);this.notification(text,'failed:'+id+':'+task.runVersion);
       }
     }
@@ -1304,12 +1392,39 @@ export class Hub {
     }
     void this.notify();this.emit();this.kickDirector();
   }
+  recordDirectorInterjection(task,addition) {
+    if(this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.interjection-accepted' AND json_extract(data,'$.chatId')=?").get(task.id,addition.chatId))return;
+    this.store.event(task.id,'director.interjection-accepted',addition);
+    const prior=this.workHandoff(task)||buildWorkHandoff({store:this.store,userText:task.prompt});
+    const additions=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='director.interjection-accepted' ORDER BY json_extract(data,'$.chatId')").all(task.id).map(row=>JSON.parse(row.data).text);
+    const interjectionBaseRequest=prior.interjectionBaseRequest||prior.userRequest||task.prompt;
+    const interjectionBaseGoal=prior.interjectionBaseGoal||prior.goal||task.prompt;
+    this.store.event(task.id,'task.work-handoff',{...prior,interjectionBaseRequest,interjectionBaseGoal,userRequest:[interjectionBaseRequest,...additions].join('\n'),goal:[interjectionBaseGoal,...additions].join('\n')});
+    this.store.meta('director:response-start:'+task.id,this.store.now());
+  }
+  notifyUnconfirmedInterjections(taskId) {
+    const unresolved=this.store.db.prepare(`SELECT json_extract(e.data,'$.source') source FROM events e
+      WHERE e.taskId=? AND e.type='director.interjection-uncertain'
+      AND NOT EXISTS (SELECT 1 FROM events a WHERE a.taskId=e.taskId AND a.type='director.interjection-accepted'
+        AND json_extract(a.data,'$.chatId')=json_extract(e.data,'$.chatId'))`).all(taskId);
+    if(!unresolved.length||this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.interjection-unconfirmed-notified'").get(taskId))return;
+    const reply='上一轮已经结束，其中的补充还没有收到会话回执。原话已留在聊天记录里。';
+    this.store.event(taskId,'director.interjection-unconfirmed-notified',{count:unresolved.length});
+    this.say(reply);
+    if(unresolved.some(row=>row.source==='qq'))this.notification(reply,`interjection-uncertain:${taskId}`);
+  }
   async queueInternalRepair(task,error) {
     const id=this.internalRepair.enqueue(task?.id,error);
     await this.internalRepair.poll();return !!id;
   }
   async collect(task) {
-    if(this.isFixedWorker(task)||this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.native-linked'").get(task.id)) {
+    if(['director','coordinator'].includes(task.role)) {
+      this.store.collection(task.id,'skipped');
+      return [];
+    }
+    const workspaceRelative=relative(resolve(this.workspaceRoot),resolve(task.cwd));
+    const externalWorker=task.role==='worker' && (!workspaceRelative || workspaceRelative==='..' || workspaceRelative.startsWith('..'+sep) || isAbsolute(workspaceRelative));
+    if(externalWorker||this.isFixedWorker(task)||this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.native-linked'").get(task.id)) {
       try {
         const records=await collectTaskDeliverables({task:this.store.task(task.id)||task,archive:this.archive,workspaceRoot:this.workspaceRoot});
         this.store.collection(task.id,'done');this.store.event(task.id,'artifacts.deliverables-collected',{count:records.length,warnings:records.warnings||[]});
@@ -1350,7 +1465,7 @@ export class Hub {
       error.code='HUB_SECRET_INPUT_REQUIRED';throw error;
     }
     if(typeof answer!=='string' || !answer.trim() || answer.length>10000)throw Error('请输入你的选择');
-    let task=this.store.task(approval.taskId);if(task.status!=='waiting')throw Error('任务当前没有等待选择');
+    const task=this.store.task(approval.taskId);if(task?.status!=='waiting')throw Error('任务当前没有等待选择');
     let chosen=answer.trim();
     if(/^\d+$/.test(chosen) && approval.options.length) {
       const option=approval.options[Number(chosen)-1];if(!option)throw Error('选项序号不存在');
@@ -1361,10 +1476,20 @@ export class Hub {
       if(approval.kind==='followup')this.run(task,'主人对前面的选择回复：'+chosen+'\n请在当前会话继续完成原任务。');
       else await this.adapters[task.engine].respond(task,approval,chosen);
       if(task.role==='director')this.store.meta('director:response-start:'+task.id,this.store.now());
-      this.store.setApproval(id,'answered',chosen);this.store.update(task.id,{status:'running'});
-      this.store.event(task.id,'approval.answered',{id,answer:chosen});this.say('好，你的选择已经交回原来的会话啦。它会接着处理。');
+      const current=this.store.task(task.id);
+      const sameRun=current?.runVersion===task.runVersion;
+      const resolving=this.store.getApproval(id)?.status==='resolving';
+      if(resolving||(sameRun&&current.status==='completed'&&this.store.getApproval(id)?.status==='interrupted')){
+        this.store.transaction(()=>{
+          this.store.setApproval(id,'answered',chosen);
+          const otherPending=this.store.db.prepare("SELECT 1 FROM approvals WHERE taskId=? AND id<>? AND status IN ('pending','resolving') LIMIT 1").get(task.id,id);
+          if(sameRun&&current.status==='waiting'&&!otherPending)this.store.update(task.id,{status:'running'});
+          this.store.event(task.id,'approval.answered',{id,answer:chosen});
+        });
+        if(this.store.task(task.id)?.status==='running')this.say('好，你的选择已经交回原来的会话啦。它会接着处理。');
+      }
       return {ok:true};
-    }catch(error){this.store.setApproval(id,'pending');throw error;}
+    }catch(error){if(this.store.getApproval(id)?.status==='resolving')this.store.setApproval(id,'pending');throw error;}
     finally {this.answering.delete(id);this.emit();}
   }
   matchingPendingDirectorApproval(text) {
@@ -1389,9 +1514,12 @@ export class Hub {
     const running=this.store.allTasks().filter(task=>active.has(task.status)&&task.role!=='director'&&task.role!=='direct');
     if(!request.target||request.all)return running;
     const target=request.target.toLocaleLowerCase();
+    if(/^(?:dsh\s*[·・:：-]?\s*)?手机(?:操控|控制|专用(?:会话|席位))$/u.test(target)) {
+      return running.filter(task=>task.role==='worker'&&this.usesPhoneSeat(task));
+    }
     return running.filter(task=>{const title=this.sessionTitleForTask(task).toLocaleLowerCase(),prompt=String(task.prompt||'').toLocaleLowerCase();return task.id.toLocaleLowerCase()===target||title===target||(target.length>=2&&(title.includes(target)||prompt.includes(target)));});
   }
-  async handlePriorityControl(text,{source='web',targetIds}={}) {
+  async handlePriorityControl(text,{source='web',targetIds,chatId}={}) {
     const request=this.priorityStopRequest(text);if(!request)return null;
     const running=Array.isArray(targetIds)?targetIds.map(id=>this.store.task(id)).filter(task=>task&&active.has(task.status)):this.stopTargets(request);
     if(request.all) {
@@ -1400,16 +1528,7 @@ export class Hub {
       this.say(reply);if(source==='qq')this.notification(reply,'stop-all:'+randomUUID());
       return {ok:true,stopped:running.length};
     }
-    if(/^(?:当前任务|当前)$/u.test(request.target))request.target='';
-    let matches=running;
-    if(request.target&&!Array.isArray(targetIds)) {
-      const target=request.target.toLocaleLowerCase();
-      matches=running.filter(task=>{
-        const title=this.sessionTitleForTask(task),prompt=String(task.prompt||'');
-        return task.id.toLocaleLowerCase()===target || title.toLocaleLowerCase()===target ||
-          (target.length>=2&&(title.toLocaleLowerCase().includes(target)||prompt.toLocaleLowerCase().includes(target)));
-      });
-    }
+    const matches=running;
     let reply,result;
     if(matches.length===1) {
       const task=matches[0],name=this.sessionTitleForTask(task);
@@ -1427,7 +1546,7 @@ export class Hub {
       reply=request.target?'没找到正在执行的「'+request.target+'」。':'现在没有可以停止的执行任务。';
       result={ok:false,error:'NO_ACTIVE_STOP_TARGET'};
     }
-    this.say(reply);if(source==='qq')this.notification(reply,`priority-stop:${createHash('sha256').update(String(text)+'\0'+reply).digest('hex').slice(0,24)}`);
+    this.say(reply);if(source==='qq')this.notification(reply,`priority-stop:${chatId}`);
     return result||{ok:true,control:'stop'};
   }
   scheduleAmendmentContinuation(id) {
@@ -1508,11 +1627,12 @@ export class Hub {
     if(this.store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='artifacts' AND type='table'").get())this.store.db.prepare("UPDATE attachment_outbox SET status='suppressed',error='用户停止任务，停止未发送的成果',updatedAt=? WHERE status='pending' AND artifactId IN (SELECT id FROM artifacts WHERE task_id=?)").run(this.store.now(),id);
     let identity={};try{identity=JSON.parse(this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='session' ORDER BY id DESC LIMIT 1").get(id)?.data||'{}');}catch{}
     let stopTimer;
-    try{await Promise.race([this.adapters[task.engine].cancel({...task,followRequestId:identity.requestId,followPromptMarker:identity.promptMarker}),new Promise((_,reject)=>{stopTimer=setTimeout(()=>reject(Error('执行端停止确认超时；已阻止后续接续，请核对原会话')),10000);})]);}
+    try{if(task.role!=='codex-direct'||this.codexDirect.current===id)await Promise.race([this.adapters[task.engine].cancel({...task,followRequestId:identity.requestId,followPromptMarker:identity.promptMarker}),new Promise((_,reject)=>{stopTimer=setTimeout(()=>reject(Error('执行端停止确认超时；已阻止后续接续，请核对原会话')),10000);})]);}
     catch(error){this.store.update(id,{error:'停止执行尚未确认：'+redact(error.message)});this.store.event(id,'task.stop-unconfirmed',{error:redact(error.message)});this.emit();throw error;}
     finally{clearTimeout(stopTimer);}
     try{const row=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='task.images' ORDER BY id DESC LIMIT 1").get(id);if(row)await this.cleanupVisualCache(JSON.parse(row.data||'{}').cleanupDirectory);}catch{}
     this.store.update(id,{status:'cancelled'});
+    if(task.role==='codex-direct')this.codexDirect.cancelled(id);
     const repairMatch=/^t-repair-([a-f0-9]{24})-\d+$/u.exec(id);
     if(repairMatch)this.store.db.prepare("UPDATE internal_repairs SET status='blocked',detail=?,updatedAt=? WHERE id=? AND status IN ('sending','accepted','delivery-uncertain','needs-action','result-received','validation-failed')").run('用户已确认停止本轮修复，不自动重新派发。',this.store.now(),repairMatch[1]);
     this.store.db.prepare("UPDATE approvals SET status='cancelled',updatedAt=? WHERE taskId=? AND status IN ('pending','resolving')").run(this.store.now(),id);
@@ -1529,15 +1649,9 @@ export class Hub {
     return {ok:true,repair:true};
   }
   exitRepairWindow() { this.store.meta('repairWindowMode','off');return {ok:true}; }
-  async repairChat(text) {
-    if(!this.codexRepairThreadId || !this.codexQueuePath) throw Error('当前 Codex 修复窗口尚未绑定');
-    const watcher=await this.prepareRepairWatcher(String(text));
-    const watchId=watcher?this.repairReturns?.queue(watcher):null;
-    try {await execFileAsync(resolveCodexExecutable({command:this.codexQueuePath}),['queue','--thread',this.codexRepairThreadId,'--message',String(text)],{windowsHide:true,timeout:15000,maxBuffer:200000});}
-    catch(error){if(watchId)this.repairReturns?.cancel(watchId);throw error;}
-    const reply='原话已排入当前 Codex 修复窗口；接收后会确认，最终回复会自动返回。';this.say(reply);this.notification(reply,'repair-window:'+randomUUID());
-    if(watcher) void this.repairReturns?.poll().catch(error=>this.store.event(null,'repair.return-poll-error',{error:redact(error.message)}));
-    return {ok:true,repair:true};
+  async repairChat(text,options) {
+    if(!this.codexRepairThreadId||!this.adapters.codex?.start)throw Error('当前 Codex 修复窗口尚未绑定');
+    return this.codexDirect.enqueue(text,options);
   }
   async prepareRepairWatcher(text) {
     try {
@@ -1601,8 +1715,10 @@ export class Hub {
   }
   directSessionStatus() {
     const pending=this.repairReturns?this.store.db.prepare("SELECT userSeen,COUNT(*) AS count FROM repair_returns WHERE status='pending' GROUP BY userSeen").all():[];
-    const queued=Number(pending.find(row=>!row.userSeen)?.count||0);
-    const processing=Number(pending.find(row=>row.userSeen)?.count||0);
+    const manual=this.store.db.prepare(`SELECT EXISTS(SELECT 1 FROM events e WHERE e.taskId=t.id AND e.type='codex-direct.started') AS started
+      FROM tasks t WHERE t.role='codex-direct' AND t.sessionId=? AND t.status IN ('queued','running','waiting')`).all(this.codexRepairThreadId);
+    const queued=Number(pending.find(row=>!row.userSeen)?.count||0)+manual.filter(row=>!row.started).length;
+    const processing=Number(pending.find(row=>row.userSeen)?.count||0)+manual.filter(row=>row.started).length;
     return {enabled:this.directMode(),title:this.store.meta('directSessionTitle')||'',connected:!!this.directBridge?.ready,kind:this.store.meta('directSessionKind')||'',repair:{enabled:this.repairMode(),queued,processing}};
   }
   detachDirectBridge() {
@@ -1667,7 +1783,7 @@ export class Hub {
       }
       return this.directChat(text);
     }
-    const control=confirmedControl?await this.handlePriorityControl(text,{source,targetIds:confirmation.targetIds}):null;if(control)return control;
+    const control=confirmedControl?await this.handlePriorityControl(text,{source,targetIds:confirmation.targetIds,chatId}):null;if(control)return control;
     const companionReply=this.companion?.command(text);
     if(companionReply){this.say(companionReply.reply);if(source==='qq')this.notification(companionReply.reply,'companion:'+randomUUID());return {ok:true,companion:true};}
     if(/^(?:直连|进入直连|直连当前会话|修复窗口|进入修复窗口|紧急修复)$/u.test(text)) {
@@ -1686,12 +1802,17 @@ export class Hub {
     if(/^(?:退出DSH直连|关闭DSH直连|退出DSH当前会话|退出\s+DSH\s+直连)$/u.test(text)) {
       const result=await this.exitDirectSession();const reply='已退出 DSH 直连，恢复主管中枢。';this.say(reply);if(source==='qq')this.notification(reply,'dsh-direct-mode-off:'+randomUUID());return result;
     }
-    if(this.repairMode()) return this.repairChat(text);
+    if(this.repairMode()) {
+      const choice=/^(?:选择|回答)\s+(\S+)\s+([\s\S]+)$/u.exec(text);
+      const approval=choice&&this.store.getApproval(choice[1]);
+      if(approval&&this.store.task(approval.taskId)?.role==='codex-direct')return this.answer(choice[1],choice[2]);
+      return this.repairChat(originalUserText,{source,messageKey});
+    }
     if(this.directMode()) return this.directChat(text);
     // Explicitly addressed repair-window messages go directly to that thread;
     // a generic worker must not be asked to forward them through a browser.
     if(/codex/iu.test(text) && /(?:直连.{0,12}会话|当前.{0,8}(?:修复窗口|这个会话)|(?:平时|一般|通常).{0,15}直连|修复窗口)/u.test(text)
-      && /(?:发给|转给|交给|跟.{0,8}说|让.{0,12}(?:完成|实现|修复|处理)|帮.{0,8}(?:完成|实现|修复))/u.test(text)) return this.repairChat(originalUserText);
+      && /(?:发给|转给|交给|跟.{0,8}说|让.{0,12}(?:完成|实现|修复|处理)|帮.{0,8}(?:完成|实现|修复))/u.test(text)) return this.repairChat(originalUserText,{source,messageKey});
     if(text==='接管' || text==='返回原助手' || text==='保留原入口') {
       if(!this.setQqMode)throw Error('QQ 路由切换不可用');const mode=text==='接管'?'all':'prefix';await this.setQqMode(mode);
       const reply=mode==='all'?'中枢已接管你的 QQ 私聊，现在直接说任务即可。随时发 /中枢 返回原助手 切回原入口。':'已返回原助手。新中枢继续用 /中枢 开头接收你的消息。';
@@ -1789,11 +1910,6 @@ export class Hub {
     const fileContext=validFileAttachments.length?await prepareQqFileContext(validFileAttachments):{text:'',imagePaths:[]};
     imagePaths=[...imagePaths,...(fileContext.imagePaths||[])].slice(0,4);
     const engine=imagePaths.length?'dsh':this.directorEngine();
-    let screenDelivery='';
-    if(requestsSharedScreen(originalUserText)&&this.shareScreen){
-      try{const result=await this.shareScreen({requestId:'chat:'+chatId});screenDelivery='用户要求发送共享画面，已通过中枢请求当前所选窗口的新截图，不需要再派工作。真实状态：'+JSON.stringify(result)+'。waiting_frame是在等共享客户端截取，queued/pending只是排队，sent=true才可说已发送；不能说没有发图通道。';}
-      catch(error){screenDelivery='本次共享画面发送未能开始：'+redact(String(error.message))+ '。请按具体状态说明，不笼统否认系统能力。';}
-    }
     const deliveryContext=fileDeliveryContext(this.store,text);
     const fileRequest=/(?:发(?:送)?给我|给我发|发我|转发给我|拿给我|(?:截图|图片|文件).{0,6}(?:发来|发过来|给我看看))/u.test(text)?'定位目标文件并复制到 outputs，回报真实路径，由中枢统一发送；保留源文件。若本轮已经自行发送，只回报文件路径和message_id供核验，不能再发送一份。无法确认目标先核对。':null;
     const visualPaths=engine==='dsh'?imagePaths:[];
@@ -1803,26 +1919,25 @@ export class Hub {
     // Plain conversational follow-ups enter the running native turn directly.
     // Approvals and attachments keep their dedicated handling paths.
     const speaking=this.store.db.prepare("SELECT * FROM tasks WHERE role='director' AND engine='dsh' AND status='running' AND prompt NOT LIKE '[内部工作回报]%' ORDER BY createdAt DESC LIMIT 1").get();
-    if(speaking?.sessionId&&engine==='dsh'&&!screenDelivery&&!fileRequest&&!replyContext.text&&!replyIds.length&&!visualPaths.length&&!validFileAttachments.length&&this.adapters.dsh.steer){
+    if(speaking?.sessionId&&engine==='dsh'&&!fileRequest&&!replyContext.text&&!replyIds.length&&!visualPaths.length&&!validFileAttachments.length&&this.adapters.dsh.steer){
       this.store.event(speaking.id,'director.interjection-requested',{chatId,source,text:prompt});
       try{
         const result=await this.adapters.dsh.steer(speaking,prompt);
         if(result?.accepted){
-          this.store.event(speaking.id,'director.interjection-accepted',{chatId,source,messageKey:messageKey||null,text:prompt});
-          const prior=this.workHandoff(speaking)||buildWorkHandoff({store:this.store,userText:speaking.prompt});
-          const additions=this.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='director.interjection-accepted'").all(speaking.id).map(row=>JSON.parse(row.data)).sort((a,b)=>Number(a.chatId)-Number(b.chatId));
-          const interjectionBaseRequest=prior.interjectionBaseRequest||prior.userRequest||speaking.prompt,interjectionBaseGoal=prior.interjectionBaseGoal||prior.goal||speaking.prompt;
-          this.store.event(speaking.id,'task.work-handoff',{...prior,interjectionBaseRequest,interjectionBaseGoal,userRequest:[interjectionBaseRequest,...additions.map(x=>x.text)].join('\n'),goal:[interjectionBaseGoal,...additions.map(x=>x.text)].join('\n')});
-          this.store.meta('director:response-start:'+speaking.id,this.store.now());
+          this.recordDirectorInterjection(speaking,{chatId,source,messageKey:messageKey||null,text:prompt});
           return {ok:true,interjected:true,task:this.store.task(speaking.id),chatId};
         }
       }catch(error){
         // Delivery may have succeeded. Do not enqueue a duplicate automatically.
         if(error.receipt==='not-received'){this.store.event(speaking.id,'director.interjection-not-received',{chatId,error:String(error.message)});}else{
-        this.store.event(speaking.id,'director.interjection-uncertain',{chatId,error:String(error.message),requestId:error.requestId||null});
-        const reply='这句插话的接收状态暂时没确认，原话已经保留；我没有重复提交。';
-        this.say(reply);if(source==='qq')this.notification(reply,`interjection-uncertain:${chatId}`);
-        return {ok:true,interjected:false,uncertain:true,chatId};
+          const addition={chatId,source,messageKey:messageKey||null,text:prompt,requestId:error.requestId||null};
+          this.store.event(speaking.id,'director.interjection-uncertain',{...addition,error:String(error.message)});
+          if(error.requestId&&this.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='dsh.steer-received' AND json_extract(data,'$.requestId')=?").get(speaking.id,error.requestId)){
+            this.recordDirectorInterjection(speaking,addition);
+            return {ok:true,interjected:true,task:this.store.task(speaking.id),chatId};
+          }
+          if(!active.has(this.store.task(speaking.id)?.status))this.notifyUnconfirmedInterjections(speaking.id);
+          return {ok:true,interjected:false,uncertain:true,chatId};
         }
       }
     }
@@ -1836,10 +1951,10 @@ export class Hub {
       }
     }
     const quotedFallback=replyIds.length&&!replyContext.text?text.match(/\[引用消息[^\]]*\][\s\S]*/u)?.[0]?.slice(0,2200):'';
-    const requestContext=[replyContext.text,quotedFallback,screenDelivery,fileContext.text,deliveryContext].filter(Boolean).join('\n\n').slice(0,8000);
+    const requestContext=[replyContext.text,quotedFallback,fileContext.text,deliveryContext].filter(Boolean).join('\n\n').slice(0,8000);
     const task=await this.create({engine,prompt:visualPrompt,messageKey,role:'director',imagePaths:visualPaths,originalUserText,requestContext});
     if(validFileAttachments.length)this.store.event(task.id,'task.file-attachments',{attachments:validFileAttachments.map(item=>({path:item.path,originalName:item.originalName,size:item.size,mimeType:item.mimeType,extension:item.extension}))});
-    this.store.event(task.id,'task.work-handoff',{...buildWorkHandoff({store:this.store,userText:prompt,goal:prompt}),executionEngine:this.workerEngine()});
+    this.store.event(task.id,'task.work-handoff',{...buildWorkHandoff({store:this.store,userText:originalUserText,goal:prompt,currentTaskId:task.id,referencedTaskIds:replyContext.taskReferences||[],referencedNativeSessions:replyContext.nativeReferences||[]}),executionEngine:this.workerEngine()});
     this.store.event(task.id,'chat.request',{chatId,source,...(messageKey?{messageKey}:{}),...(explicit?{requestedEngine:explicit.engine}:{})});
     if(fileRequest) {
       const handoff=this.workHandoff(task) || buildWorkHandoff({store:this.store,userText:prompt,goal:prompt});

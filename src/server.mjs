@@ -1,5 +1,6 @@
 import {createScopedFilePostcondition} from './computer-control/file-postcondition.mjs';
 import {LocalModelServices} from './local-model-services.mjs';
+import {WorkPresence} from './work-presence.mjs';
 import {sampleLocalGpu,sampleLocalTaskStalls} from './local-resource-sampler.mjs';
 import {FileOperations} from './knowledge/file-operations.mjs';
 import {createFileOperationsRoutes} from './http/file-operations-routes.mjs';
@@ -37,6 +38,7 @@ import { createDshRouterAdapter } from './adapters/dsh-router.mjs';
 import { displayArtifact, displayArtifacts } from './knowledge/display.mjs';
 import { createCodexAdapter, resolveCodexExecutable } from './adapters/codex.mjs';
 import { QqBridge, isUserFacingNotification,OWNER } from './qq.mjs';
+import { GmGame } from './gm.mjs';
 import {createFileDeliverySupport} from './hub/file-delivery.mjs';
 import {QqVoice} from './qq-voice.mjs';
 import {VoicePlayback,serveVoiceRecording} from './http/voice-playback.mjs';
@@ -65,7 +67,7 @@ import { ProactiveCompanion } from './proactive-companion.mjs';
 import { NewsCompanion } from './news-companion.mjs';
 import { CompanionDiary } from './companion-diary.mjs';
 import { CompanionDailyReview } from './companion-daily-review.mjs';
-import { createResearchRunner } from './director-plugin/research.mjs';
+import { createResearchRunner, publicSearchResults } from './director-plugin/research.mjs';
 import { Reports } from './reports.mjs';
 import { ResultNarrator } from './narrator.mjs';
 import {createRepairModelProbe} from './observability/repair-model-probe.mjs';
@@ -87,6 +89,8 @@ import { createPoller } from './poller.mjs';
 import { createTaskRoutes } from './http/task-routes.mjs';
 import { NativeSessions } from './native-sessions.mjs';
 import { createNativeSessionRoutes } from './http/native-session-routes.mjs';
+import {createToolOrchestrationRoutes} from './http/tool-orchestration-routes.mjs';
+import {conversationSource} from './hub/tool-orchestration.mjs';
 import { createStateView } from './http/state-view.mjs';
 import { findResolvedErrorIds } from './http/error-recovery.mjs';
 import { RuntimeMetrics } from './observability/runtime-metrics.mjs';
@@ -207,13 +211,13 @@ export async function createControlServer(options={}) {
   const companionReady=()=>{
     try{const status=JSON.parse(readFileSync(join(runtime,'dsh-capability-source.json'),'utf8'));if(status.version!==2||!status.tools?.includes('hub_recall')||!status.tools?.includes('hub_profile_read'))return false;/* A DSH restart or test cleanup may leave active=false with a valid capability manifest. The manifest's tool set is the readiness contract; do not block every user message on a stale child PID. */return true;}catch{return false;}
   };
-  const sharedDshOptions={provider:openCode.provider,reasoningEffort:config.dshReasoningEffort,workerPreset:'standard',imageRoot:qqMediaRoot,imageRoots:controlImageRoots({runtime,qqMediaRoot,archiveRoot:archive.root,visualCacheRoot})};
+  const sharedDshOptions={sessionHeaderLookup:true,provider:openCode.provider,reasoningEffort:config.dshReasoningEffort,workerPreset:'standard',imageRoot:qqMediaRoot,imageRoots:controlImageRoots({runtime,qqMediaRoot,archiveRoot:archive.root,visualCacheRoot})};
   const adapters=options.adapters || {
     // All new work uses the historical QQ/Mornye DSH on 3080. 3180 is only
     // constructed when an operator explicitly enables the compatibility fallback.
     dsh:createDshRouterAdapter({primaryUrl:dshPrimaryUrl,trustedPrimaryHost:discoveredDsh?.host || null,fallbackUrl:dshFallbackUrl,directorUrl:dshDirectorUrl,directorToPrimary,directorOptions:{...sharedDshOptions,directorPreset:config.dshDirectorPreset || 'minimal'},fallbackOptions:{...sharedDshOptions,directorPreset:'minimal'},primaryOptions:{...sharedDshOptions,companionReady,supervisorSelection,promptRequestDedup:localDshPromptDedup(),directorPreset:config.dshDirectorPreset || 'minimal',workerPreset:config.dshWorkerPreset || 'standard',launchToken:process.env.DSH_LAUNCH_TOKEN || discoveredDsh?.launchToken,launchTokenProvider:()=>process.env.DSH_LAUNCH_TOKEN || discoverLocalDsh()?.launchToken}}),
     codex:createCodexAdapter({command:config.codexCommand,proxyUrl:config.codexProxyUrl || existingSystemProxy(),sandboxMode:config.codexSandbox || 'workspace-write'}),
-    ...(existsSync(workbuddyInstall.cli) && existsSync(join(runtime,'workbuddy-home','models.json'))?{workbuddy:createWorkBuddyAdapter({cliPath:workbuddyInstall.cli,env:{CODEBUDDY_CONFIG_DIR:join(runtime,'workbuddy-home'),CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS:'1'}})}:{})
+    ...(existsSync(workbuddyInstall.cli) && existsSync(join(runtime,'workbuddy-home','models.json'))?{workbuddy:createWorkBuddyAdapter({cliPath:workbuddyInstall.cli,fullPermissions:config.workbuddyFullPermissions===true,env:{CODEBUDDY_CONFIG_DIR:join(runtime,'workbuddy-home'),CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS:'1'}})}:{})
   };
   dailyTokens.wrap(adapters);
   const qqModeFile=join(runtime,'qq-mode');
@@ -225,7 +229,8 @@ export async function createControlServer(options={}) {
   const singingConfigFile=join(runtime,'singing.json');
   const singingConfig=existsSync(singingConfigFile)?JSON.parse(readFileSync(singingConfigFile,'utf8')):null;
   const singing=singingConfig?new CompanionSinging({...singingConfig,store,root:join(runtime,'singing'),runtimeRoot:join(runtime,'singing')}):null;
-  let hub;const qq=options.qq || new QqBridge({store,voice,preparedAudio:row=>preparedSingingAudio(singing,row),onMessage:(text,meta)=>hub.chat(text,meta),onChange:()=>{health.qq=qq.connected?'online':'offline';emit();},enabled:!!config.qqIngressEnabled,notificationEnabled:!!config.qqIngressEnabled,notificationFilter:isUserFacingNotification,mediaRoot:qqMediaRoot,incomingFileMaxBytes:config.qqIncomingFileMaxBytes,incomingFileTotalBytes:config.qqIncomingFileTotalBytes,incomingFileTimeoutMs:config.qqIncomingFileTimeoutMs,getMode:getQqMode,incomingBatchMs:2000,canBatchIncoming:()=>!!hub&&!hub.repairMode()&&!hub.directMode(),...(existsSync(join(runtime,'qq-config.json'))?{configFile:join(runtime,'qq-config.json')}:{})});
+  const gm=adapters.codex?new GmGame({store,adapter:adapters.codex,cwd:join(workspaceRoot,'_gm'),onDelivery:()=>qq.flush()}):null;
+  let hub;const qq=options.qq || new QqBridge({store,gm,voice,preparedAudio:row=>preparedSingingAudio(singing,row),onMessage:(text,meta)=>hub.chat(text,meta),onChange:()=>{health.qq=qq.connected?'online':'offline';emit();},enabled:!!config.qqIngressEnabled,notificationEnabled:!!config.qqIngressEnabled,notificationFilter:isUserFacingNotification,mediaRoot:qqMediaRoot,incomingFileMaxBytes:config.qqIncomingFileMaxBytes,incomingFileTotalBytes:config.qqIncomingFileTotalBytes,incomingFileTimeoutMs:config.qqIncomingFileTimeoutMs,getMode:getQqMode,incomingBatchMs:2000,canBatchIncoming:()=>!!hub&&!hub.repairMode()&&!hub.directMode(),...(existsSync(join(runtime,'qq-config.json'))?{configFile:join(runtime,'qq-config.json')}:{})});
   const ensureGuardian=()=>{
     if(!config.primaryMode || options.noQq || process.platform!=='win32' || !existsSync(join(root,'scripts','ensure-guardian.ps1')))return;
     const log=message=>appendFileSync(join(runtime,'guardian-bootstrap.log'),new Date().toISOString()+' '+redact(String(message))+'\n');
@@ -274,7 +279,7 @@ export async function createControlServer(options={}) {
   const proactive=new ProactiveCompanion({store,companion,hub,adapter:adapters.dsh,cwd:directorProjectPath,
     drawings,
     agentPreset:adapters.dsh?.directorPreset || 'standard',
-    isAvailable:()=>!closing && !reloadQueued && !options.noQq && !!config.qqIngressEnabled && qq.connected && health.dshPrimary==='online',
+    isAvailable:()=>!gm?.state().enabled && !closing && !reloadQueued && !options.noQq && !!config.qqIngressEnabled && qq.connected && health.dshPrimary==='online',
     onChange:emit});
   const research=createResearchRunner();
   const news=new NewsCompanion({store,companion,hub,preferences,adapter:adapters.dsh,cwd:directorProjectPath,
@@ -362,10 +367,11 @@ export async function createControlServer(options={}) {
     try{return await hub.create({engine:'dsh',role:'director',prompt,imagePaths,imageCleanupDirectory:cleanupDirectory,project:'桌面检查',messageKey:'desktop-inspection:'+action.id});}
     catch(error){if(cleanupDirectory)rmSync(cleanupDirectory,{recursive:true,force:true});throw error;}
   };
-  const narrator=new ResultNarrator({adapter:adapters.dsh,store,cwd:directorProjectPath,model:config.dshReportModel || undefined,sessionKey:'dshReporterSessionId',agentPreset:adapters.dsh?.directorPreset||'minimal',behaviorForTask:()=>companion.behaviorSettings(),documentPaths:()=>companion.documentPaths(),personaForTask:()=>companion.reportingPersona()});
+  const narrator=new ResultNarrator({contextRoot:join(runtime,'native-context','dsh'),adapter:adapters.dsh,store,cwd:directorProjectPath,model:config.dshReportModel || undefined,sessionKey:'dshReporterSessionId',agentPreset:adapters.dsh?.directorPreset||'minimal',behaviorForTask:()=>companion.behaviorSettings(),documentPaths:()=>companion.documentPaths(),personaForTask:()=>companion.reportingPersona()});
   const repairProbe=createRepairModelProbe({store,narrator,modelConnection});
   hub.internalRepair.validate=repairValidator({store,root,connectionProbe:repairProbe});
   const reports=new Reports({store,hub,archive,narrator,personaForTask:()=>companion.reportingPersona()});hub.reports=reports;
+  const workPresence=new WorkPresence({store,hub,reports,companion,isAvailable:()=>!closing&&!reloadQueued&&!options.noQq&&!!config.qqIngressEnabled&&qq.connected&&health.dshPrimary==='online',onChange:emit});hub.workPresence=workPresence;
   const agentCompletions=new AgentCompletions({store,reports,runtime,repairThreadId:config.codexRepairThreadId,internalRepair:hub.internalRepair,onChange:emit});
   const screenCompanion=new ScreenCompanion({store,hub,companion,adapter:adapters.dsh,cwd:directorProjectPath,runtime,pythonCommand:config.libraryPythonCommand,onChange:emit});
   const remoteCompanion=createRemoteCompanion({store,hub,companion,adapter:adapters.dsh,cwd:directorProjectPath,runtime,workspaceRoot,archive,reports,pythonCommand:config.libraryPythonCommand,onChange:emit,clientPackagePath:()=>remoteClientPackage(root).path});
@@ -377,10 +383,11 @@ export async function createControlServer(options={}) {
   const nativeTasks=new DshTaskReturns({store,hub,baseUrl:dshPrimaryUrl,trustedHost:discoveredDsh?.host || null,launchToken:discoveredDsh?.launchToken || null,launchTokenProvider:()=>discoverLocalDsh()?.launchToken,enabled:!options.noQq});hub.nativeTasks=nativeTasks;
   const sessionRetention=new SessionRetention({store,nativeTasks,companion});
   const nativeSessions=options.nativeSessions||new NativeSessions({nativeTasks,workbuddyProjects:[join(homedir(),'.workbuddy/projects'),join(homedir(),'.codebuddy/projects'),join(runtime,'workbuddy-home/projects')]});
+  hub.nativeSessions=nativeSessions;
   const importer=new LibraryImport({store,archive,workspaceRoot,pythonCommand:config.libraryPythonCommand || 'python'});
   const library=new Library({store,archive,hub,adapter:adapters.dsh,workspaceRoot,visualCacheRoot,pythonCommand:config.libraryPythonCommand,onChange:emit});
   let importChain=Promise.resolve(),closing=false,reloadQueued=false,stickerTimer,reloadTimer;
-  const reloadState=()=>reloadActivity(store,{computerBroker,proactive,news,diary,dailyReview,singing,qq,screenCompanion,remoteCompanion,reports,drawings,mailMonitor,localServices,internalRepair:hub.internalRepair});
+  const reloadState=()=>reloadActivity(store,{computerBroker,workPresence,proactive,news,diary,dailyReview,singing,qq,gm,screenCompanion,remoteCompanion,reports,drawings,mailMonitor,localServices,internalRepair:hub.internalRepair});
   const scheduleReload=(reason,jobId=null)=>{
     if(closing||reloadQueued)return false;
     reloadQueued=true;
@@ -443,6 +450,7 @@ export async function createControlServer(options={}) {
     return sessionUrl;
   }});
   const nativeSessionRoutes=createNativeSessionRoutes({store,hub,nativeSessions,remoteSupervisor:new RemoteSupervisor({store,remote:remoteCompanion.remote}),body,json});
+  const toolOrchestrationRoutes=createToolOrchestrationRoutes({store,body,json});
   const server=createServer(async(req,res)=>{
     // A framed local control page could otherwise relay real clicks to privileged actions.
     res.setHeader('X-Frame-Options','DENY');
@@ -459,6 +467,7 @@ export async function createControlServer(options={}) {
         if(reloadQueued && path!=='/api/system/reload')return json(res,503,{error:'中枢正在进行安全重载，稍后再试'});
       }
       if(path.startsWith('/api/file-operations') && await fileOperationsRoute(req,res,url)!==false)return;
+      if(path==='/api/coordinator/tool'&&await toolOrchestrationRoutes(req,res,url)!==false)return;
       if(path==='/api/tasks/history'&&req.method==='GET')return json(res,200,await stateView.taskHistory({before:Number(url.searchParams.get('before')||Number.MAX_SAFE_INTEGER),limit:Number(url.searchParams.get('limit')||40)}));
       if(path==='/api/local-resources'&&req.method==='GET')return json(res,200,{...localServices.state(),samplingIntervalMs:localSampleIntervalMs});
       if(path==='/api/system/maintenance'&&req.method==='GET')return json(res,200,maintenanceView({loaded:releaseIdentity,disk:captureReleaseIdentity(root),activity:reloadState(),resources:localServices.state()}));
@@ -513,7 +522,7 @@ export async function createControlServer(options={}) {
         if(req.headers['x-agent-notice-token']!==agentCompletions.token)return json(res,403,{error:'完成回执认证失败'});
         return json(res,202,await agentCompletions.ingest(await body(req)));
       }
-      if(path==='/api/workers' && req.method==='GET')return json(res,200,{workers:hub.fixedWorkerPool(),policy:'上下文连续优先；独立任务从三个DSH席位选空闲；工作记忆共用且按需检索；共用手机等独占资源串行'});
+      if(path==='/api/workers' && req.method==='GET')return json(res,200,{workers:hub.fixedWorkerPool(),policy:'上下文连续优先；独立任务在所选引擎中优先使用空闲席；DSH 手机专用席独占设备'});
       if(path==='/api/workers/memory' && req.method==='GET')return json(res,200,recallWorkerMemory(join(runtime,'control.sqlite'),{query:url.searchParams.get('q')||'',contextTaskId:url.searchParams.get('task')||undefined}));
       if(path==='/api/metrics' && req.method==='GET') {
         const hours=Number(url.searchParams.get('hours')||24);
@@ -627,8 +636,24 @@ export async function createControlServer(options={}) {
         }
       }
       if(await nativeSessionRoutes(req,res,url))return;
-      if(path==='/api/workbuddy'&&req.method==='GET')return json(res,200,workbuddyInstall.status);
+      if(path==='/api/research/search'&&req.method==='POST'){
+        const input=await body(req);
+        const query=typeof input?.query==='string'?input.query.trim():'';
+        if(!query||query.length>500)return json(res,400,{error:'搜索词需要为 1–500 个字符'});
+        try{
+          const results=publicSearchResults(await research({action:'web-search',query}));
+          if(!results.length)return json(res,502,{error:'公开搜索未返回可核对的网页来源'});
+          return json(res,200,{results});
+        }catch{return json(res,502,{error:'公开搜索服务暂时无法完成查询'});}
+      }
+      if(path==='/api/workbuddy'&&req.method==='GET')return json(res,200,{...workbuddyInstall.status,taskPermissionMode:config.workbuddyFullPermissions===true?'full':'restricted'});
       if(path==='/api/workbuddy/open'&&req.method==='POST'){await body(req);return json(res,200,await openDomesticWorkbuddy(workbuddyInstall));}
+      if(path==='/api/workbuddy/mail-preview'&&req.method==='POST'){
+        const query=await body(req);
+        if(mailMonitor.provider!=='qq-imap')return json(res,409,{error:'本入口只读取已绑定的普通 QQ 邮箱，当前普通 QQ 邮箱连接不可用'});
+        try{return json(res,200,await mailMonitor.preview({date:query.date,limit:query.limit}));}
+        catch(error){if(/^请提供有效的上海日期|^邮件查询条数/u.test(error.message))return json(res,400,{error:error.message});return json(res,502,{error:'中枢已绑定的普通 QQ 邮箱暂时读取失败'});}
+      }
       if(await taskRoutes(req,res,url))return;
       if(path==='/api/specialists' && req.method==='GET')return json(res,200,specialists.state());
       const specialistEngine=/^\/api\/specialists\/(maintenance|librarian)\/engine$/.exec(path);
@@ -666,6 +691,8 @@ export async function createControlServer(options={}) {
         res.writeHead(200,{'Content-Type':'text/markdown; charset=utf-8','Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent('记忆时间线.md')});res.end(timeline.exportMarkdown());return;
       }
       if(path==='/api/companion/behavior' && req.method==='POST'){companion.saveBehaviorSettings(await body(req));emit();return json(res,200,companionSnapshot());}
+      if(path==='/api/companion/work-presence'&&req.method==='GET')return json(res,200,workPresence.settings());
+      if(path==='/api/companion/work-presence'&&req.method==='POST')return json(res,200,workPresence.configure(await body(req)));
       if(path==='/api/companion/proactive' && req.method==='POST'){
         const value=await body(req);
         if(value.enabled===undefined && value.phoneAutonomyEnabled===undefined)throw Error('需要主动联系或手机自主使用设置');
@@ -746,7 +773,8 @@ export async function createControlServer(options={}) {
         const value=await body(req,1600000);
         if(value.token){screenCompanion.authorize(value.token);return json(res,202,screenCompanion.sendSharedFrame({requestId:value.requestId,image:value.image}));}
         if(value.image!==undefined||typeof value.sessionId!=='string')return json(res,403,{error:'发送共享画面需要当前共享令牌或主管本轮的用户请求'});
-        const task=store.db.prepare("SELECT id,prompt FROM tasks WHERE role='director' AND sessionId=? AND status='running' ORDER BY createdAt DESC LIMIT 1").get(value.sessionId);
+        const actor=store.db.prepare("SELECT * FROM tasks WHERE role='coordinator' AND sessionId=? AND status='running' ORDER BY createdAt DESC LIMIT 1").get(value.sessionId);
+        const task=actor&&conversationSource(store,actor);
         const arrival=task&&store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='chat.request' ORDER BY id DESC LIMIT 1").get(task.id);
         const chatId=arrival?JSON.parse(arrival.data||'{}').chatId:null;
         const user=chatId&&store.db.prepare("SELECT text FROM companion_chat WHERE id=? AND role='user' AND retractedAt IS NULL").get(chatId);
@@ -787,7 +815,8 @@ export async function createControlServer(options={}) {
         if(value.artifactIds!==undefined && (!Array.isArray(value.artifactIds)||value.artifactIds.length>100||value.artifactIds.some(id=>typeof id!=='string')))throw Error('文件编号无效');
         return json(res,202,specialists.enqueue(specialistRun[1],{request:value.text||'检查并整理当前项目',...(value.artifactIds?{artifactIds:value.artifactIds}:{})}));
       }
-      if(path==='/api/system' && req.method==='GET')return json(res,200,{guardian:guardian.state(),qqMode:getQqMode(),primary:!!config.primaryMode,directorEngine:hub.directorEngine(),workerEngine:hub.workerEngine(),directorBusy:hub.directorBusy()});
+      if(path==='/api/system' && req.method==='GET')return json(res,200,{guardian:guardian.state(),qqMode:getQqMode(),primary:!!config.primaryMode,directorEngine:hub.directorEngine(),workerEngine:hub.workerEngine(),directorBusy:hub.directorBusy(),codexModels:hub.codexModels()});
+      if(path==='/api/system/codex-models' && req.method==='POST')return json(res,200,hub.setCodexModels(await body(req)));
       if(path==='/api/system/worker-engine' && req.method==='POST')return json(res,200,hub.setWorkerEngine((await body(req)).engine));
       if(path==='/api/system/director-engine' && req.method==='POST') {
         const result=hub.setDirectorEngine((await body(req)).engine);
@@ -835,7 +864,7 @@ export async function createControlServer(options={}) {
       }
       if(path.startsWith('/api/'))return json(res,404,{error:'接口不存在'});
       if(req.method!=='GET')return json(res,405,{error:'不支持的请求'});
-      const publicFiles=new Set(['index.html','delivery.html','delivery.js','app.js','file-manager.js','file-operations.js','local-resources.js','screen-companion.js','remote-devices.html','remote-devices.js','server-monitor.js','styles.css','default-avatar.png','default-avatar.png','persona-avatars/default-avatar.png']);
+      const publicFiles=new Set(['index.html','delivery.html','delivery.js','app.js','file-manager.js','file-operations.js','local-resources.js','screen-companion.js','remote-devices.html','remote-devices.js','server-monitor.js','styles.css','default-avatar.png','default-avatar.png','persona-avatars/default-avatar.png','persona-avatars/taosaki-rin.png']);
       const name=path==='/'?'index.html':path.slice(1);if(!publicFiles.has(name))return json(res,404,{error:'页面不存在'});
       const filePath=join(root,'public',name);if(!existsSync(filePath))return json(res,404,{error:'页面尚未生成'});
       const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.png':'image/png','.txt':'text/plain; charset=utf-8'};
@@ -885,7 +914,7 @@ export async function createControlServer(options={}) {
     await hub.superviseWorkers();
     await hub.resumeInterrupted();
   },error=>store.error(null,'主管调度失败：'+error.message));
-  const repairPoll=createPoller(()=>hub.repairReturns?.poll(),error=>store.event(null,'repair.return-poll-error',{error:redact(error.message)}));
+  const repairPoll=createPoller(async()=>{hub.codexDirect.pump();await hub.repairReturns?.poll();},error=>store.event(null,'repair.return-poll-error',{error:redact(error.message)}));
   const libraryPoll=createPoller(()=>library.poll(),error=>store.error(null,'资料分类调度失败：'+error.message));
   const guardianPoll=createPoller(()=>config.primaryMode?guardian.poll():undefined,error=>store.error(null,'守护状态读取失败：'+error.message));
   const healthPoll=createPoller(checkHealth,error=>store.error(null,'健康状态检查失败：'+error.message));
@@ -894,12 +923,12 @@ export async function createControlServer(options={}) {
     const jobId=store.meta('specialists:reload');
     if(jobId&&!options.noQq&&!closing&&!reloadQueued&&!reloadState().busy)scheduleReload('source-reload',jobId);
   },error=>store.error(null,'专职会话调度失败：'+error.message));
-  const app={server,store,archive,hub,qq,health,personaIdentity,remoteCompanion,specialists,library,importer,nativeTasks,metrics,proactive,news,diary,dailyReview,mailMonitor,localServices,fileOperations,reconcileErrors:clearRecoveredErrors,
+  const app={server,store,archive,hub,qq,health,personaIdentity,remoteCompanion,specialists,library,importer,nativeTasks,metrics,proactive,workPresence,news,diary,dailyReview,mailMonitor,localServices,fileOperations,reconcileErrors:clearRecoveredErrors,
     async start(){
       await new Promise((yes,no)=>{server.once('error',no);server.listen(port,'127.0.0.1',yes);});
       if(options.remotePort!==undefined||(!options.noQq&&config.remoteCompanion?.enabled!==false)){try{await remoteCompanion.remote.start(options.remotePort??config.remoteCompanion?.port??3190);}catch(error){store.event(null,'remote.gateway-start-failed',{error:redact(error.message)});}}
       timelineTimer=setInterval(()=>{try{refreshTimeline();}catch(error){store.event(null,'timeline.refresh-failed',{error:redact(error.message)});}},60000);timelineTimer.unref?.();
-      if(!options.noQq)qq.start();/* Distribution: external guardians are operator-managed. */
+      if(!options.noQq){gm?.start();qq.start();}/* Distribution: external guardians are operator-managed. */
       void syncPersonaIdentity();
       computerBroker?.expireStaleApprovals?.();
       if(computerBroker){computerApprovalTimer=setInterval(()=>{try{computerBroker.expireStaleApprovals?.();emit();}catch(error){store.error(null,'桌面审批过期检查失败：'+redact(error.message));}},30000);computerApprovalTimer.unref?.();}
@@ -927,6 +956,7 @@ export async function createControlServer(options={}) {
       if(!options.noQq)sessionRetention.start();
       drawings.start();
       proactive.start();
+      workPresence.start();
       news.start();
       diary.start();
       dailyReview.start();
@@ -939,7 +969,7 @@ export async function createControlServer(options={}) {
       const deploymentPath=join(runtime,'deployment.json');if(existsSync(deploymentPath)){const deployment=JSON.parse(readFileSync(deploymentPath,'utf8'));if(deployment.status==='pending'){deployment.status='healthy';deployment.readyAt=store.now();writeFileSync(deploymentPath,JSON.stringify(deployment,null,2));}}return server.address();
     },
     async close(){
-      closing=true;clearTimeout(reloadTimer);specialists.stopping=true;hub.stopping=true;
+      closing=true;clearTimeout(reloadTimer);specialists.stopping=true;hub.stopping=true;gm?.close();
       if(reloadQueued)checkpointDshReload(store);
       clearInterval(timelineTimer);clearInterval(stickerTimer);await stickers.close?.();
       loopDelay.disable();clearTimeout(recoveryTimer);clearInterval(reportTimer);clearInterval(healthTimer);clearInterval(guardianTimer);clearInterval(specialistTimer);clearInterval(nativeTimer);clearInterval(computerApprovalTimer);
@@ -949,6 +979,7 @@ export async function createControlServer(options={}) {
       await serverMonitor.close();
       await mailMonitor.close();
       await proactive.close();
+      workPresence.close();
       await news.close();
       diary.close();
       dailyReview.close();

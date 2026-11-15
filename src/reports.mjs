@@ -3,6 +3,7 @@ import { ensureDeliverableSchema,isDeclaredDeliverable } from './knowledge/task-
 import { isInternalSession } from './observability/internal-sessions.mjs';
 import {progressRequestIsCurrent,isProgressReportKind} from './report-progress.mjs';
 import {reportFallback} from './report-fallback.mjs';
+import {redact} from './redact.mjs';
 import {refreshFileDelivery} from './hub/file-delivery.mjs';
 import { enqueueReportDelivery,enqueueNamedReportDelivery,reconcileNamedReportDelivery,reconcileAllNamedReportDeliveries,reportChunkRows,
   ensureReportDeliverySchema,persistNamedRequest,claimNamedRequest,settleNamedRequest,failNamedRequest,releaseNamedRequest,pendingNamedRequests } from './report-delivery.mjs';
@@ -115,12 +116,13 @@ export class Reports {
     if(committed?.body) {if(!this.namedProgressRequestIsCurrent(key))return null;settleNamedRequest(this.store,key,committed.status);return committed.body;}
     const claimed=claimNamedRequest(this.store,key);
     if(!claimed)return this.waitForNamedBody(key);
+    let narrationDone=false;
     try {
       const task=JSON.parse(claimed.request),artifacts=JSON.parse(claimed.artifacts||'[]');
       if(claimed.kind==='screen-observation'&&!this.hub.screenCompanionActive){settleNamedRequest(this.store,key,'suppressed');return null;}
       if(claimed.kind==='agent-completion'&&!this.externalNoticeIsCurrent(key)) {settleNamedRequest(this.store,key,'suppressed');return null;}
       if(this.messageRetracted(task.id,task)){settleNamedRequest(this.store,key,'suppressed');return null;}
-      if(['progress-update','director-delay'].includes(claimed.kind)&&!this.progressRequestIsCurrent(task)) {
+      if(isProgressReportKind(claimed.kind)&&!this.progressRequestIsCurrent(task)) {
         this.suppressStaleProgressRequest(key,claimed.taskId);return null;
       }
       const outcome=await Promise.race([
@@ -129,9 +131,10 @@ export class Reports {
       ]);
       if(outcome.stopped) {releaseNamedRequest(this.store,key);return null;}
       const text=String(outcome.text||'').trim();
+      narrationDone=!!text;
       if(this.stopping) {releaseNamedRequest(this.store,key);return null;}
       if(this.messageRetracted(task.id,task)){settleNamedRequest(this.store,key,'suppressed');return null;}
-      if(['progress-update','director-delay'].includes(claimed.kind)&&!this.progressRequestIsCurrent(task)) {
+      if(isProgressReportKind(claimed.kind)&&!this.progressRequestIsCurrent(task)) {
         this.suppressStaleProgressRequest(key,claimed.taskId);return null;
       }
       if(!text)throw new Error('汇报会话没有生成可发送的内容');
@@ -146,6 +149,10 @@ export class Reports {
       return delivery?.body||text;
     } catch(error) {
       if(this.stopping) {releaseNamedRequest(this.store,key);return null;}
+      if(claimed.kind==='work-companion'&&!reconcileNamedReportDelivery(this.store,key)?.body){
+        settleNamedRequest(this.store,key,'suppressed');this.store.event(claimed.taskId,'companion.work-presence-failed',{reason:narrationDone?'delivery-enqueue-failed':'generation-not-completed',error:redact(error.message).slice(0,300)});
+        if(narrationDone)this.store.error(claimed.taskId,'工作陪聊投递入队失败：'+redact(error.message).slice(0,300));return null;
+      }
       const outcome=failNamedRequest(this.store,key,error);
       this.store.event(claimed.taskId,'narrator.queue-error',{kind:claimed.kind,attempts:outcome?.attempts,status:outcome?.status});
       throw error;

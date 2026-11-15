@@ -1,10 +1,10 @@
-import {reconcileResolvedSources,reviewDormant,promoteDormant,settleValidatedRepair,repairAttemptLimit} from './repair-review.mjs';
+import {reconcileResolvedSources,reviewDormant,promoteDormant,settleValidatedRepair,repairAttemptLimit,codexWriterRecovery} from './repair-review.mjs';
 import {createHash} from 'node:crypto';
 import {redact} from '../redact.mjs';
 import {repairDeliveryState} from './repair-delivery-state.mjs';
 import {repairReceipt} from './repair-contract.mjs';
 import {writeRepairWorkOrder} from './repair-work-order.mjs';
-import {errorStrategy} from '../error-strategy.mjs';
+import {codexWriterBusy,errorStrategy} from '../error-strategy.mjs';
 
 // Durable delivery intents. Delivery acceptance is deliberately not repair success.
 export class InternalRepair {
@@ -21,6 +21,11 @@ export class InternalRepair {
     store.db.prepare("UPDATE internal_repairs SET status='waiting-provider' WHERE status='pending' AND (error LIKE '%prefill_cap_refused%' OR error LIKE '%the cell is at capacity%' OR error LIKE '%insufficient_quota%')").run();
     if(threadId)store.meta(`internal-session:codex:${threadId}`,'automatic-repair');
     store.db.prepare("UPDATE internal_repairs SET status='delivery-uncertain' WHERE status='sending'").run();
+    for(const row of store.db.prepare("SELECT * FROM internal_repairs WHERE status IN ('pending','needs-action','validated') AND error LIKE '%already has an active writer%'").all()){
+      if(store.task(row.taskId)?.engine!=='codex'||codexWriterRecovery(store,row))continue;
+      store.db.prepare("UPDATE internal_repairs SET status='blocked',updatedAt=?,feedback=? WHERE id=?").run(store.now(),'等待原 Codex 会话的真实完成记录。',row.id);
+      store.event(row.taskId,'internal-repair.native-writer-blocked',{repairId:row.id,previousStatus:row.status});
+    }
     for(const row of store.db.prepare("SELECT id,error FROM internal_repairs WHERE status='pending'").all())if(['rate-limit','quota-exhausted'].includes(errorStrategy(row.error).category))store.db.prepare("UPDATE internal_repairs SET status='waiting-provider' WHERE id=?").run(row.id);
   }
   enqueue(taskId,error,{sourceId=null,occurredAt=null}={}){
@@ -40,7 +45,8 @@ export class InternalRepair {
         this.store.event(taskId||null,'internal-repair.recurrence',{previousId:base,repairId:id,sourceId});
       }
     }
-    const status=['rate-limit','quota-exhausted'].includes(errorStrategy(error).category)?'waiting-provider':'pending';
+    const status=codexWriterBusy(error)&&this.store.task(taskId)?.engine==='codex'?'blocked'
+      :['rate-limit','quota-exhausted'].includes(errorStrategy(error).category)?'waiting-provider':'pending';
     this.store.db.prepare("INSERT OR IGNORE INTO internal_repairs(id,taskId,error,status,createdAt,updatedAt) VALUES(?,?,?,?,?,?)").run(id,taskId||null,text,status,this.store.now(),this.store.now());
     return id;
   }
@@ -91,7 +97,10 @@ export class InternalRepair {
         try{
           const verification=await this.validate(result);
           if(!settleValidatedRepair(this,result))return;
-        }catch(error){if(error.code!=='REPAIR_DEFERRED'){
+        }catch(error){if(error.code==='REPAIR_NATIVE_WRITER_BLOCKED'){
+          this.store.db.prepare("UPDATE internal_repairs SET status='blocked',updatedAt=?,feedback=? WHERE id=? AND status='result-received'").run(this.store.now(),error.message,result.id);
+          this.store.event(result.taskId,'internal-repair.native-writer-blocked',{repairId:result.id});
+        }else if(error.code!=='REPAIR_DEFERRED'){
           this.store.db.prepare("UPDATE internal_repairs SET status='needs-action',updatedAt=?,feedback=?,nextAttempt=? WHERE id=? AND status='result-received'").run(this.store.now(),redact(String(error.message)).slice(-5000),this.now()+30000,result.id);
           this.store.event(result.taskId,'internal-repair.verification-rejected',{repairId:result.id,error:redact(error.message).slice(-1000)});
         }}finally{this.validating=false;}

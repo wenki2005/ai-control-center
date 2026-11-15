@@ -47,6 +47,18 @@ export function parseExplicitEngineCommand(text) {
   return match ? { engine: match[1].toLowerCase(), prompt: match[2] } : null;
 }
 
+export function requestsBoundInbox(prompt) {
+  const text=String(prompt??'');
+  const queries=/(?:查看|查找|查阅|查一下|查查|查邮件|看看|看一下|检查|核对|读一下|读取|总结|汇总|整理|有没有|有什么|有哪些|收到[了过]?)/u;
+  const mail=/(?:邮箱|收件箱|邮件|电子邮件)/u;
+  const otherMailbox=/(?:\b(?:agent(?:ly)?\s*(?:mail|邮箱|收件箱)|gmail|outlook)|@agent\.qq\.com|(?:163|网易|企业微信)\s*(?:邮箱|收件箱))/iu;
+  const action=/(?:帮我|替我|顺便|请|然后|再|^\s*)(?:先|去|把.{0,15})?\s*(?:发送|发一[封条]|发邮件|回复|回信|回邮件|转发|删除|标记|移动|授权|登录|绑定|接入)/u;
+  return text.split(/[。；;！？!?\n\r]+/u).some(part=>{
+    return mail.test(part)&&queries.test(part)&&!otherMailbox.test(part)&&!action.test(part)
+      &&!/^(?:\s*(?:不要|别|不用|无需).{0,12}(?:查|看|读|整理))/u.test(part);
+  });
+}
+
 /**
  * Resolve a proposed dispatch. Directors still require the user to name a
  * non-DSH engine; the second-level coordinator may choose any available engine
@@ -55,6 +67,10 @@ export function parseExplicitEngineCommand(text) {
 export function resolveDispatchEngine({ parentPrompt, proposedEngine, taskPrompt, availableEngines, autoRoute = false, selectedEngine, continuationEngine } = {}) {
   const requested = requestedEngine(parentPrompt);
   if (requested) return requested;
+  const original=String(parentPrompt?.prompt??parentPrompt??'');
+  if(autoRoute&&(!availableEngines||availableEngines.includes('workbuddy'))&&requestsBoundInbox(original)&&requestsBoundInbox(taskPrompt||original))return 'workbuddy';
+  if(selectedEngine==='codex'&&(!Array.isArray(availableEngines)||availableEngines.includes('dsh'))
+    &&requiresPhoneResource(`${String(parentPrompt?.prompt??parentPrompt??'')}\n${String(taskPrompt??'')}`))return 'dsh';
   if(selectedEngine&&selectedEngine!=='auto') {
     if(!['dsh','codex','workbuddy'].includes(selectedEngine)||Array.isArray(availableEngines)&&!availableEngines.includes(selectedEngine))throw Error('所选任务引擎当前不可用，请修改任务执行设置；不会自动改派其他引擎。');
     return selectedEngine;

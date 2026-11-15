@@ -65,6 +65,19 @@
             <div class="form-feedback" id="task-feedback" role="status"></div>
           </form>
         </section>
+        <details class="system-window" id="worker-pool-window">
+          <summary>固定会话 <small>查看任务、补充要求、指定派发</small></summary>
+          <section class="panel">
+            <div id="worker-pool-list"></div>
+            <form id="worker-pool-composer" class="dispatch-panel" hidden>
+              <label class="field-label" id="worker-pool-target" for="worker-pool-prompt"></label>
+              <textarea id="worker-pool-prompt" rows="3" maxlength="20000" required></textarea>
+              <div class="task-actions"><button id="worker-pool-submit" type="submit">提交</button><button id="worker-pool-dismiss" type="button">收起输入</button></div>
+            </form>
+            <p id="worker-pool-status" role="status">展开后查看席位。</p>
+            <button id="worker-pool-refresh" type="button">刷新席位状态</button>
+          </section>
+        </details>
 
           </div>
 
@@ -190,6 +203,14 @@
               <button class="system-check" id="worker-engine-save" type="submit">保存任务引擎</button>
               <div class="form-feedback" id="worker-engine-feedback" role="status" aria-live="polite"></div>
             </form>
+            <form class="director-engine-settings" id="codex-model-form">
+              <div class="director-engine-heading"><strong>Codex 模型</strong><small>分别设置新对话和新派发任务的模型</small></div>
+              <label class="director-engine-field" for="codex-director-model"><span>主管模型</span><input id="codex-director-model" list="codex-model-options" maxlength="80" required value="gpt-6.1-terra"></label>
+              <label class="director-engine-field" for="codex-worker-model"><span>工作模型</span><input id="codex-worker-model" list="codex-model-options" maxlength="80" required value="gpt-6.1-sol"></label>
+              <datalist id="codex-model-options"><option value="gpt-6.1-terra"><option value="gpt-6.1-sol"><option value="gpt-6-astra"><option value="gpt-6-sol"><option value="gpt-6-luna"></datalist>
+              <button class="system-check" type="submit">保存 Codex 模型</button>
+              <div class="form-feedback" id="codex-model-feedback" role="status" aria-live="polite"></div>
+            </form>
           </details>
           <button class="system-check" id="system-check" type="button">检查并恢复</button>
           <div class="form-feedback" id="system-feedback" role="status"></div>
@@ -200,9 +221,6 @@
             <div id="agent-completion-sources"></div>
             <div id="agent-completion-recent"></div>
           </details>
-          <details class="system-window" id="worker-pool-window"><summary>工作会话池 <small>三个 DSH 席位，空闲优先</small></summary>
-          <section class="panel"><p>独立任务可分给三个 DSH 工作会话并行执行。首次使用才建立会话，之后持续复用；同一任务的补充和重试保留原会话。</p><div id="worker-pool-list"></div><button id="worker-pool-refresh" type="button">刷新席位状态</button><p id="worker-pool-status" role="status"></p></section>
-        </details>
         <details class="system-window" id="daily-token-window"><summary>每日 Token <small>当天消耗、会话排行、七日趋势</small></summary>
           <section class="panel">
             <form id="daily-token-form"><label>统计日期 <input id="daily-token-date" type="date" required></label><button type="submit">查看</button> <button id="daily-token-refresh" type="button">刷新</button></form>
@@ -264,6 +282,7 @@
                   <p>关闭后暂停主动分享。日常闲聊在 09:00–23:00，连续 15 分钟无互动后才考虑；主管忙碌或有未送达消息时暂缓。晨报和重要新闻按下面的单独设置运行。</p>
                   <div class="proactive-status" id="proactive-status" role="status">读取设置中…</div>
                   <label class="news-option-row"><span><strong>自主使用手机</strong><small>空闲时自己选内容、浏览应用，发现有趣的事再分享；沿用主动联系时段</small></span><span class="proactive-toggle"><input id="phone-autonomy-enabled" type="checkbox" aria-label="允许自主使用手机"><span aria-hidden="true"></span></span></label>
+                  <label class="news-option-row"><span><strong>工作时也聊几句</strong><small>长任务期间聊点相关或轻松的话题；消息送达前会核对任务状态</small></span><span class="proactive-toggle"><input id="work-presence-enabled" type="checkbox" aria-label="允许工作期间陪聊"><span aria-hidden="true"></span></span></label>
                   <details class="companion-window" id="phone-social-window"><summary>刷手机与评论草稿</summary>
                     <p id="phone-social-status" role="status">展开后检查手机连接。</p>
                     <form id="phone-social-form">

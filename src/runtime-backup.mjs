@@ -93,6 +93,20 @@ function inspectDatabase(file) {
   } finally {db.close();}
 }
 
+export async function publishRuntimeSnapshot(source,target,{move=rename,inspect=lstat,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
+  const delays=[50,100,200,400];
+  for(let attempt=0;;attempt++) {
+    try { await move(source,target); return; }
+    catch(error) {
+      if(!['EPERM','EACCES','EBUSY'].includes(error.code)||attempt>=delays.length)throw error;
+      const sourceInfo=await inspect(source).catch(e=>{if(e.code==='ENOENT')return null;throw e;});
+      const targetInfo=await inspect(target).catch(e=>{if(e.code==='ENOENT')return null;throw e;});
+      if(!sourceInfo?.isDirectory()||sourceInfo.isSymbolicLink()||targetInfo)throw error;
+      await wait(delays[attempt]);
+    }
+  }
+}
+
 export async function createRuntimeBackup({runtimeRoot,backupRoot=path.join(runtimeRoot,'backups'),companionRoot=null,createdAt=new Date()}={}) {
   if(typeof runtimeRoot!=='string'||!path.isAbsolute(runtimeRoot))throw new TypeError('runtimeRoot must be an absolute path');
   runtimeRoot=path.resolve(runtimeRoot);backupRoot=path.resolve(backupRoot);
@@ -121,7 +135,7 @@ export async function createRuntimeBackup({runtimeRoot,backupRoot=path.join(runt
     const manifest={version:1,createdAt:createdAt.toISOString(),database:{file:'control.sqlite',size:databaseInfo.size,sha256:await sha256File(databasePath)},archive:{root:'knowledge/files',fileCount:files.length,files},companionDocuments,verification:{...dbCheck,allArchiveHashesChecked:true}};
     const handle=await open(path.join(temporary,'manifest.json'),'wx');
     try{await handle.writeFile(JSON.stringify(manifest,null,2)+'\n','utf8');await handle.sync();}finally{await handle.close();}
-    await rename(temporary,target);
+    await publishRuntimeSnapshot(temporary,target);
     return {path:target,manifest};
   } catch(error) {await rm(temporary,{recursive:true,force:true});throw error;}
 }

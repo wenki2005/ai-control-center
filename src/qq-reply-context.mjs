@@ -1,4 +1,5 @@
 import {notificationContext,selectNotificationReferences} from './knowledge/notification-context.mjs';
+import {continuationRequested,independentRequest} from './routing/session-continuation.mjs';
 export function approvalOptionAnswer(text,options=[]) {
   const value=String(text).trim().replace(/[。！!]+$/u,'');
   const ordinal=/^(?:选|选择|就)?第?([一二三四五六七八九十\d]+)(?:个|项|种)?(?:吧|好了)?$/u.exec(value);
@@ -9,13 +10,16 @@ export function approvalOptionAnswer(text,options=[]) {
 }
 /** Resolve only confirmed sent messages; queued notifications are not conversation. */
 export function qqReplyContext(store,{text='',replyIds=[]}={}) {
-  const excerpts=[],approvals=[],files=[];
+  const excerpts=[],approvals=[],files=[],taskReferences=[],nativeReferences=[];
   for(const id of replyIds.slice(0,2)) {
     const incoming=store.db.prepare("SELECT attachments FROM inbox WHERE messageId=? AND status='done'").get('qq:'+id);
     if(incoming)try{files.push(...JSON.parse(incoming.attachments).filter(x=>x&&typeof x==='object'));}catch{}
     const row=store.db.prepare(`SELECT o.* FROM qq_delivery_attempts a JOIN outbox o ON o.id=a.outboxId
       WHERE a.platformMessageId=? AND a.status='sent' ORDER BY a.finishedAt DESC LIMIT 1`).get(String(id));
-    if(!row)continue;
+    if(!row || row.dedupe.startsWith('gm:'))continue;
+    const taskId=/^(?:task-report:[^:]+|failed|completed):(t-[\w-]+)/u.exec(row.dedupe)?.[1];
+    if(taskId&&store.task(taskId))taskReferences.push(taskId);
+    if(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='agent_completion_receipts'").get())for(const receipt of store.db.prepare("SELECT engine,sessionId,title FROM agent_completion_receipts WHERE batchKey=? AND state='queued'").all(row.deliveryGroup))nativeReferences.push({...receipt,scope:'local',source:'platform-confirmed-quoted-native-notice'});
     const group=store.db.prepare("SELECT text,dedupe FROM outbox WHERE deliveryGroup=? AND status='sent' ORDER BY partIndex").all(row.deliveryGroup);
     excerpts.push('用户引用的已发送消息：\n'+(group.length?group.map(p=>p.text).join('\n'):row.text).slice(0,2200));
     const match=/^approval:(a-[\w-]+)/u.exec(row.dedupe);if(match)approvals.push(match[1]);
@@ -25,8 +29,21 @@ export function qqReplyContext(store,{text='',replyIds=[]}={}) {
     const recent=store.db.prepare("SELECT attachments,createdAt FROM inbox WHERE status='done' AND attachments!='[]' ORDER BY createdAt DESC,rowid DESC LIMIT 1").get();
     if(recent&&Date.now()-Date.parse(recent.createdAt)<86400000)try{files.push(...JSON.parse(recent.attachments).filter(x=>x&&typeof x==='object'));}catch{}
   }
-  if(!replyIds.length){const notices=notificationContext(store,text);if(notices)excerpts.push(notices);}
-  return {text:excerpts.join('\n\n'),files:files.slice(0,4),approvalId:approvals.length===1?approvals[0]:null};
+  if(!replyIds.length){
+    const notices=notificationContext(store,text);if(notices)excerpts.push(notices);
+    if(continuationRequested(text)&&!independentRequest(text)){
+      const now=Date.now(),selected=selectNotificationReferences(store,text).filter(n=>!n.approvalId&&now-Date.parse(n.savedAt)<2*3600000);
+      const anchored=selected.filter(n=>n.score>0),referential=/(?:这个|那个|刚才|刚刚|上面|前面|那条|这条)/u.test(text);
+      const references=anchored.length?anchored:referential&&(selected.length===1||selected.every(n=>n.taskId))?selected:[];
+      for(const n of references){
+        if(n.taskId&&store.task(n.taskId))taskReferences.push(n.taskId);
+        if(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='agent_completion_receipts'").get()){
+          for(const receipt of store.db.prepare("SELECT engine,sessionId,title FROM agent_completion_receipts WHERE batchKey=? AND state='queued'").all(n.deliveryGroup))nativeReferences.push({...receipt,scope:'local',source:'platform-confirmed-context-native-notice'});
+        }
+      }
+    }
+  }
+  return {text:excerpts.join('\n\n'),files:files.slice(0,4),approvalId:approvals.length===1?approvals[0]:null,taskReferences:[...new Set(taskReferences)],nativeReferences};
 }
 
 /** Resolve a nearby failure report, never a generic historical failed task. */
@@ -38,7 +55,7 @@ function recentFailureReference(store,text) {
   if(users[0]?.text===text)users.shift();
   const previousTime=Date.parse(users[0]?.createdAt||'');
   const since=new Date(Math.max(cutoff,Number.isFinite(previousTime)?previousTime:cutoff)).toISOString();
-  const recent=store.db.prepare("SELECT text,dedupe,deliveryGroup,updatedAt FROM outbox WHERE status='sent' AND updatedAt>=? AND updatedAt<=? ORDER BY updatedAt DESC,rowid DESC LIMIT 12").all(since,new Date(now).toISOString());
+  const recent=store.db.prepare("SELECT text,dedupe,deliveryGroup,updatedAt FROM outbox WHERE status='sent' AND dedupe NOT LIKE 'gm:%' AND updatedAt>=? AND updatedAt<=? ORDER BY updatedAt DESC,rowid DESC LIMIT 12").all(since,new Date(now).toISOString());
   const selected=new Set(selectNotificationReferences(store,text,{now,since,repairReference:true}).map(n=>n.deliveryGroup));
   const groups=new Set(),candidates=[];
   for(const row of recent){

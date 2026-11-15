@@ -39,8 +39,9 @@ export function expressionContext(query='',recent=[]) {
   else if(/(?:难过|委屈|撑不住|孤独|压力大|迷茫|好累|累死)/u.test(text)){scene='support';cue='先回应这次具体处境，陪着或问一个必要的小问题；不默认连续复述、安慰再给建议。';}
   else if(text.length<=60&&/^(?:嗯[，,、 ]*)?(?:好[的呀，, ]*)?(?:谢谢|谢啦|辛苦|多谢|麻烦你了|知道了|收到)/u.test(text)){scene='acknowledgment';cue='轻轻接一句就够了，可以流露一点开心或亲近，留白也自然；不突然追问旧话题。';}
   else if(/(?:想你|喜欢你|夸你|你.{0,5}(?:可爱|聪明|漂亮|厉害))/u.test(text)){scene='affection';cue='按当前人设的性子回应亲近或夸奖，可以小得意、害羞或轻轻嘴硬，不需要整段抒情。';}
-  else if(/(?:我刚|今天我|给你看|看到|听到|这首|这张|晚霞)/u.test(text)){scene='sharing';cue='先回应分享中的一个具体细节，给自己的小看法；有真好奇再问，不自动盘问。';}
   else if(/(?:代码|报错|修复|派单|工具调用|配置|部署|检查|方案)/u.test(text)){scene='practical';cue='先回应眼前实际问题，语气仍是当前人设；不让旧的小情绪抢掉正事。';}
+  else if(/(?:你(?:自己)?(?:更)?(?:喜欢哪|想听|想聊|想选|挑一|选一)|按你的喜好|你(?:来|自己)决定|你.{0,5}(?:真坏|逗我|小气)|逗你的)/u.test(text)){scene='personal';cue='对方把话题或选择交给你了。按当前人设拿个主意，讲一个具体的偏好或小心思；轻松打趣时可以回一句俏皮话，接着把话说完。';}
+  else if(/(?:我刚|今天我|给你看|看到|听到|这首|这张|晚霞)/u.test(text)){scene='sharing';cue='像聊天一样接住分享里的一个具体细节，可以笑、吐槽或说说自己的想法。话说到位就停，有真好奇再问。';}
   const previous=recent.map(row=>String(row?.text??row));
   const openings=previous.map(value=>/^(唔|嗯[，, ]*好|嗯|欸|诶|哼|才没有|好吧)/u.exec(value.trim().replace(/^你[，,：:\s]*/u,''))?.[1]).filter(Boolean);
   const repeated=[...new Set(openings)].filter(word=>openings.filter(value=>value===word).length>=2);
@@ -50,5 +51,18 @@ export function expressionContext(query='',recent=[]) {
   if(repeated.length)variation.push('近期常用“'+repeated.slice(0,2).join('、')+'”起头，这次直接接具体内容也可以。');
   if(previous.slice(0,4).filter(value=>/[?？][”」』]*\s*$/u.test(value)).length>=3)variation.push('最近常以问句收尾，这次可以只分享感想或停在一句回应。');
   if(previous.slice(0,4).filter(value=>/我(?:会)?(?:一直|都)?在|别(?:太)?担心|慢慢来/u.test(value)).length>=2)variation.push('最近安慰句较多，换成贴着具体情境的回应，不照搬安慰套话。');
+  if (['conversation', 'sharing', 'personal', 'affection'].includes(scene)
+    && previous.slice(0,4).filter(value=>/(?:记得|早点|别(?:忘|空着|饿着|硬撑)|可以先垫)/u.test(value)).length>=2) {
+    variation.unshift('最近已经叮嘱过几次。接这次的话，先省掉顺手加上的提醒；用户问怎么办时就直接给主意。');
+  }
   return {scene,cue,mechanism,inheritAffect:!['practical','acknowledgment','boundary'].includes(scene),variation:variation.join('')};
+}
+
+export function outreachExpression(waiting) {
+  const opening = '有合适的未完话题，就接用户原话里的细节；也可以聊一个按当前角色口味挑的小话题，给出自己的看法或小心思。用户明确说过的偏好和纠正优先，角色想象不能当作共同经历。';
+  if (waiting?.mayPout) {
+    return '这次等久了确实有点不高兴。时机合适就用当前人设说一句真有点气的小别扭，可以直接说感受，也可以顺手接回刚才的话题。用自己的口吻，不写成撒娇模板；气话说自己当下的感受，不猜对方故意冷落，也不讨回复或道歉。' + opening;
+  }
+  return '开场就说想分享的那个具体点。对熟悉的事可以轻轻得意、吐槽或嘴硬一句，之后自然说正题。' + opening
+    + (waiting?.unanswered > 0 ? '上一轮还没回，这次可以分享新的事；小别扭只对事和玩笑，别拿没回复当话题。' : '');
 }

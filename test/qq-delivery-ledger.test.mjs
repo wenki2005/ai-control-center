@@ -43,6 +43,25 @@ test('success without a platform receipt stays unknown and is never resent',asyn
  finally{await bridge.close();store.close();}
 });
 
+test('closing during a voice send preserves unknown delivery and withholds its next segment',async()=>{
+ const store=new Store(':memory:');
+ let started, rejectSend;
+ const sending=new Promise(resolve=>{started=resolve;});
+ const blocked=new Promise((_,reject)=>{rejectSend=reject;});
+ const voice={shouldSpeak:()=>true,prepareDelivery:async()=>({}),deliverPrepared:async()=>{started();return blocked;}};
+ const bridge=new QqBridge({store,onMessage:async()=>{},intervalMs:0,voice});
+ try{
+  const first=store.enqueue('语音第一段','voice:part:0');
+  store.enqueue('语音第二段','voice:part:1');
+  const flushing=bridge.flush();await sending;
+  const closing=bridge.close();rejectSend(Object.assign(Error('连接断开，回执丢失'),{uncertain:true}));
+  await Promise.all([flushing,closing]);
+  assert.equal(store.db.prepare('SELECT status FROM outbox WHERE id=?').get(first.id).status,'uncertain');
+  assert.equal(store.db.prepare('SELECT status FROM qq_delivery_attempts').get().status,'uncertain');
+  assert.deepEqual(eligibleNotifications(store),[]);
+ }finally{await bridge.close();store.close();}
+});
+
 test('indexed groups remain independent with a large blocked backlog',()=>{
  const store=new Store(':memory:');try{
   store.transaction(()=>{for(let i=0;i<1000;i++){const r=store.enqueue('unknown','blocked'+i+':part:0');store.notification(r.id,'uncertain');store.enqueue('tail','blocked'+i+':part:1');}store.enqueue('ready','independent:part:0');});

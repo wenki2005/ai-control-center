@@ -1,6 +1,9 @@
-import { resolveDispatchEngine } from '../routing/engine-policy.mjs';
+import { createHash } from 'node:crypto';
+import { requestedEngine, resolveDispatchEngine } from '../routing/engine-policy.mjs';
+import { fixedWorkerSlotForTask, requestedFixedWorker } from '../routing/fixed-worker.mjs';
 import { buildWorkHandoff } from '../hub/work-handoff.mjs';
 import { amendmentIdempotencyKey } from '../hub/task-amendments.mjs';
+import {isSessionContinuationError} from '../routing/session-continuation.mjs';
 
 const isExplicitTest=title=>/(测试|验收|回归|联调|自动测试|连接测试|\btest\b|runtime\s*check)/iu.test(String(title||''));
 const isLegacyDispatchAutomation=title=>/^中枢派发 ·/u.test(String(title||''));
@@ -146,10 +149,57 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
       }
       return json(res,200,{task}),true;
     }
+    if(path==='/api/director/fixed-worker' && req.method==='POST') {
+      const {requestId,sessionId,action,engine,slot,text}=await body(req);
+      const caller=typeof requestId==='string'?store.task(requestId):null;
+      if(!caller||caller.role!=='coordinator'||caller.engine!=='dsh'||caller.status!=='running'||!sessionId||caller.sessionId!==sessionId)
+        return json(res,403,{error:'固定席位操作需要当前工具编排会话'}),true;
+      if(!['dispatch','amend'].includes(action)||typeof text!=='string'||!text.trim()||text.length>20000)
+        return json(res,400,{error:'请选择派发或补充，并填写具体工作内容'}),true;
+      const seat=hub.fixedWorkerPool().find(worker=>worker.engine===engine&&worker.slot===slot);
+      if(!seat)return json(res,404,{error:'这个固定席位目前不可用，请刷新席位列表'}),true;
+      const handoff=hub.workHandoff(caller);
+      const original=handoff?.userRequest||caller.prompt;
+      const named=requestedFixedWorker(original);
+      const explicitEngine=named?.engine||requestedEngine(original);
+      if(explicitEngine&&engine!==explicitEngine||named&&slot!==named.slot)
+        return json(res,409,{error:'席位和用户点名的目标不一致'}),true;
+
+      const taskAtSeat=task=>task?.role==='worker'&&task.engine===engine&&hub.isFixedWorker(task)&&fixedWorkerSlotForTask(task,hub.workspaceRoot)===slot;
+      const publicTask=task=>({id:task.id,status:task.status,engine:task.engine,sessionTitle:hub.sessionTitleForTask(task)});
+      const key='fixed-seat-amend:'+caller.id;
+      const recorded=store.db.prepare('SELECT taskId,status FROM task_amendments WHERE idempotencyKey=?').get(key);
+      const linked=linkedDispatch(caller);
+      if(recorded||linked) {
+        const existing=recorded?store.task(recorded.taskId):linked;
+        if(!taskAtSeat(existing)||(recorded?'amend':'dispatch')!==action)
+          return json(res,409,{error:'本轮已有工作提交，请沿该任务继续核对'}),true;
+        return json(res,200,{accepted:true,recorded:!!recorded,duplicate:true,task:publicTask(existing)}),true;
+      }
+      if(action==='amend') {
+        if(!handoff?.amendTaskId&&!seat.running&&seat.queued>1)
+          return json(res,409,{error:'这个席位有多项排队任务，请先核对要补充哪一项'}),true;
+        const targetId=handoff?.amendTaskId||seat.task?.id;
+        const target=targetId?store.task(targetId):null;
+        if(!taskAtSeat(target))return json(res,409,{error:'这个席位没有匹配的原任务，请核对席位或选择派新任务'}),true;
+        const result=await hub.message(target.id,text,{messageKey:key,source:'supervisor'});
+        store.event(caller.id,'director.amended',{workerId:target.id});
+        return json(res,200,{...result,accepted:true,task:publicTask(store.task(target.id))}),true;
+      }
+      if(handoff?.amendTaskId)return json(res,409,{error:'本轮是补充原任务，请用补充操作'}),true;
+      const configured=handoff?.executionEngine||hub.workerEngine();
+      if(!explicitEngine&&configured!=='auto'&&configured!==engine)
+        return json(res,409,{error:'所选席位和本轮执行引擎设置不一致'}),true;
+      const digest=createHash('sha256').update('fixed-seat-dispatch').digest('hex').slice(0,24);
+      const imageEvent=store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='task.images' ORDER BY id DESC LIMIT 1").get(caller.id);
+      let imagePaths=[];try{imagePaths=JSON.parse(imageEvent?.data||'{}').paths||[];}catch{}
+      const task=await hub.create({engine,workerSlot:slot,pinFixedWorker:true,prompt:text,messageKey:`coordinator:${caller.id}:${digest}`,imagePaths});
+      return json(res,200,{accepted:true,task:publicTask(store.task(task.id))}),true;
+    }
     if(path==='/api/director/amend-task' && req.method==='POST') {
       const {sessionId,targetTaskId,text}=await body(req);
       if(typeof sessionId!=='string'||typeof targetTaskId!=='string')return json(res,400,{error:'原会话或任务引用无效'}),true;
-      const caller=store.db.prepare("SELECT * FROM tasks WHERE engine='dsh' AND role='director' AND sessionId=? AND status='running' ORDER BY createdAt DESC LIMIT 1").get(sessionId);
+      const caller=store.db.prepare("SELECT * FROM tasks WHERE engine='dsh' AND role='coordinator' AND sessionId=? AND status='running' ORDER BY createdAt DESC LIMIT 1").get(sessionId);
       if(!caller)return json(res,403,{error:'当前主管请求已结束，请勿从旧会话重复操作'}),true;
       const target=store.task(targetTaskId);if(!target||target.role!=='worker')return json(res,404,{error:'找不到原工作任务'}),true;
       const result=await hub.message(target.id,text,{messageKey:`native-amend:${amendmentIdempotencyKey(caller.id+':'+target.id,String(text))}`,source:'supervisor'});
@@ -215,9 +265,11 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
       const already=linkedDispatch(caller);
       if(already)return json(res,200,{accepted:true,task:{id:already.id,engine:already.engine,sessionTitle:hub.sessionTitleForTask(already),role:already.role}}),true;
       const key=`director:${caller.id}:${dispatchKey}`;
-      const handoff=buildWorkHandoff({store,userText:caller.prompt,goal:prompt.trim(),...(contextTaskId?{sourceTaskId:contextTaskId}:{})});
+      const current=hub.workHandoff(caller)||buildWorkHandoff({store,userText:caller.prompt,currentTaskId:caller.id});
+      const handoff=contextTaskId?{...current,...buildWorkHandoff({store,userText:current.userRequest||caller.prompt,goal:prompt,sourceTaskId:contextTaskId})}:{...current,goal:prompt};
       const effectiveEngine=hub.directorRequestedEngine(caller)||engine;
-      const coordinator=await hub.create({engine:'dsh',role:'coordinator',prompt:`[二级协调]\n执行引擎：${effectiveEngine}。${project?`\n项目建议：${project}`:''}\n执行目标：${prompt.trim()}\n用户原话：${caller.prompt}`,messageKey:key,handoff:{...hub.workHandoff(caller),...handoff,preferredEngine:effectiveEngine}});
+      let coordinator;try{coordinator=await hub.create({engine:'dsh',role:'coordinator',prompt:`[二级协调]\n执行引擎：${effectiveEngine}。${project?`\n项目建议：${project}`:''}\n执行目标：${prompt}\n用户原话：${caller.prompt}`,messageKey:key,handoff:{...handoff,preferredEngine:effectiveEngine}});}
+      catch(error){if(isSessionContinuationError(error))return json(res,409,{error:error.message,code:error.code,candidates:error.candidates,needsClarification:error.code==='NATIVE_SESSION_AMBIGUOUS'}),true;throw error;}
       return json(res,200,{accepted:true,task:{id:coordinator.id,engine:coordinator.engine,sessionTitle:hub.sessionTitleForTask(coordinator),role:'coordinator'}}),true;
     }
     const session=/^\/api\/tasks\/([^/]+)\/session$/.exec(path);
@@ -239,9 +291,11 @@ export function createTaskRoutes({store,hub,body,json,sessionLink,sessionUrlFor,
       return true;
     }
     if(path==='/api/tasks' && req.method==='POST') {
-      const {engine,prompt,model,messageKey,project}=await body(req);
-      const task=await hub.create({engine,prompt,model,messageKey,project});
-      json(res,201,{accepted:true,task:{id:task.id,engine:task.engine,sessionTitle:hub.sessionTitleForTask(task)}});return true;
+      const {engine,prompt,model,messageKey,project,workerSlot}=await body(req);
+      const task=await hub.create({engine,prompt,model,messageKey,project,workerSlot,pinFixedWorker:workerSlot!==undefined});
+      store.event(task.id,'task.user-origin',{source:'api'});
+      const current=store.task(task.id);
+      json(res,201,{accepted:true,task:{id:task.id,engine:task.engine,status:current.status,sessionTitle:hub.sessionTitleForTask(current)}});return true;
     }
     if(path==='/api/chat' && req.method==='POST') {
       await hub.chat((await body(req)).text);json(res,200,{accepted:true});return true;

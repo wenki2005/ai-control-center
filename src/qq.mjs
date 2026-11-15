@@ -13,6 +13,7 @@ import { conversationDeliveryGate } from './companion-conversation.mjs';
 import { sharedCardText } from './qq-link-cards.mjs';
 import { QqIncomingBatches, isImmediateQqInput } from './qq-incoming-batches.mjs';
 import { isMenuCommand, quickMenu, voiceModeCommand } from './quick-menu.mjs';
+import { isGmDelivery } from './gm.mjs';
 import { downloadQqFile, QQ_INCOMING_FILE_MAX_BYTES, QQ_INCOMING_FILE_TOTAL_BYTES, QQ_INCOMING_FILE_TIMEOUT_MS } from './qq-incoming-files.mjs';
 
 export const QQ_CONFIG = process.env.HUB_QQ_CONFIG || 'runtime/qq-config.json';
@@ -207,8 +208,9 @@ export function isUserFacingNotification(row) {
   return true;
 }
 export class QqBridge {
-  constructor({store,onMessage,onChange=()=>{},configFile=QQ_CONFIG,enabled=false,notificationEnabled=true,notificationFilter=()=>true,getMode=()=> 'prefix',intervalMs=900,delay=ms=>new Promise(resolve=>setTimeout(resolve,ms)),mediaRoot=null,mediaFetch=globalThis.fetch,incomingFileMaxBytes=QQ_INCOMING_FILE_MAX_BYTES,incomingFileTotalBytes=QQ_INCOMING_FILE_TOTAL_BYTES,incomingFileTimeoutMs=QQ_INCOMING_FILE_TIMEOUT_MS,incomingBatchMs=0,canBatchIncoming=()=>true,voice=null,preparedAudio=()=>null}) {
+  constructor({store,onMessage,gm=null,onChange=()=>{},configFile=QQ_CONFIG,enabled=false,notificationEnabled=true,notificationFilter=()=>true,getMode=()=> 'prefix',intervalMs=900,delay=ms=>new Promise(resolve=>setTimeout(resolve,ms)),mediaRoot=null,mediaFetch=globalThis.fetch,incomingFileMaxBytes=QQ_INCOMING_FILE_MAX_BYTES,incomingFileTotalBytes=QQ_INCOMING_FILE_TOTAL_BYTES,incomingFileTimeoutMs=QQ_INCOMING_FILE_TIMEOUT_MS,incomingBatchMs=0,canBatchIncoming=()=>true,voice=null,preparedAudio=()=>null}) {
     this.voice=voice;this.preparedAudio=preparedAudio;
+    this.gm=gm;
     Object.assign(this,{store,onMessage,onChange,configFile,enabled,notificationEnabled,notificationFilter,getMode,intervalMs,delay,mediaRoot,mediaFetch,incomingFileMaxBytes:boundedIncomingLimit(incomingFileMaxBytes,QQ_INCOMING_FILE_MAX_BYTES,256*1024*1024),incomingFileTotalBytes:boundedIncomingLimit(incomingFileTotalBytes,QQ_INCOMING_FILE_TOTAL_BYTES,512*1024*1024),incomingFileTimeoutMs:boundedIncomingLimit(incomingFileTimeoutMs,QQ_INCOMING_FILE_TIMEOUT_MS,120_000)});
     if(mediaRoot)mkdirSync(mediaRoot,{recursive:true});
     ensureDeliveryLedger(store);
@@ -277,6 +279,7 @@ export class QqBridge {
     return this.call('send_private_msg',{user_id:Number(OWNER),message:[{type:'record',data:{file:pathToFileURL(file).href}}]},delivery);
   }
   async sendPrepared(row,file) {
+    if(isGmDelivery(row))return this.call('send_private_msg',{user_id:Number(OWNER),message:[{type:'text',data:{text:row.text}}]},{outboxId:row.id});
     if(file) {
       try{const receipt=requireSendReceipt(await this.sendRecord(file,{outboxId:row.id}));this.store.event(null,'qq.voice-sent',{outboxId:row.id,messageId:receipt.message_id});return receipt;}
       catch(error){if(error.uncertain!==false||row.preparedAudioRequired)throw error;this.store.event(null,'qq.voice-fallback',{outboxId:row.id,reason:'QQ明确拒绝语音，改发文字'});}
@@ -293,13 +296,14 @@ export class QqBridge {
     if(event.post_type!=='message' || event.message_type!=='private' || String(event.user_id)!==OWNER || String(event.sender?.user_id || event.user_id)!==OWNER) return false;
     if(!event.message_id) return false;
     const quickText=eventText(event);
-    if(this.getMode()!=='all' && !isHubCommand(quickText)) return false;
+    const gmInput=this.gm?.accepts(quickText.replace(/^\/(?:中枢|hub)\s*/i,''));
+    if(this.getMode()!=='all' && !isHubCommand(quickText) && !gmInput) return false;
     // A disabled bridge is a true no-op: do not fetch quoted messages or media
     // while the original QQ channel still owns this conversation.
     if(!this.enabled) return false;
     const messageId='qq:'+event.message_id;
     if(this.store.db.prepare('SELECT status FROM inbox WHERE messageId=?').get(messageId))return true;
-    const enriched=await enrichEventText(event,this.call.bind(this),this.mediaRoot,messageId,this.mediaFetch,{maxBytes:this.incomingFileMaxBytes,totalLimit:this.incomingFileTotalBytes,timeoutMs:this.incomingFileTimeoutMs});
+    const enriched=gmInput?{text:quickText,userText:quickText,attachments:[]}:await enrichEventText(event,this.call.bind(this),this.mediaRoot,messageId,this.mediaFetch,{maxBytes:this.incomingFileMaxBytes,totalLimit:this.incomingFileTotalBytes,timeoutMs:this.incomingFileTimeoutMs});
     for(const error of enriched.attachmentErrors || [])this.store.error(null,`QQ 入站附件失败：${error}`);
     this.store.db.exec('CREATE TABLE IF NOT EXISTS qq_input_context(messageId TEXT PRIMARY KEY,userText TEXT NOT NULL,replyIds TEXT NOT NULL)');
     this.store.db.prepare('INSERT OR IGNORE INTO qq_input_context VALUES(?,?,?)').run(messageId,enriched.userText??enriched.text,JSON.stringify(enriched.replyIds||[]));
@@ -322,6 +326,10 @@ export class QqBridge {
     const current=this.store.db.prepare('SELECT * FROM inbox WHERE messageId=?').get(record.messageId);
     if(!current || current.status!=='pending' || (current.nextAttemptAt && Date.parse(current.nextAttemptAt)>Date.now()))return;
     record={...record,...current};
+    if(this.gm?.accepts(record.text)) {
+      await this.inputBatches?.flush();
+      this.gm.handle(record);this.onChange();return;
+    }
     if(isMenuCommand(record.text)) {
       await this.inputBatches?.flush();
       this.store.transaction(()=>{this.store.say('user',record.text);this.store.incomingDone(record.messageId);this.store.enqueue(quickMenu(this.store),'quick-menu:'+record.messageId);});this.onChange();
@@ -423,7 +431,7 @@ export class QqBridge {
         if(!predecessorReady(this.store,row))continue;
         const preparedVoice=await this.preparedAudio(row);
         let voiceFile=preparedVoice,voicePlan=null,sendRow=row;
-        if(!preparedVoice && this.voice?.shouldSpeak(row,conversationGate)) {
+        if(!isGmDelivery(row) && !preparedVoice && this.voice?.shouldSpeak(row,conversationGate)) {
           const voiceStarted=Date.now();
           this.store.event(null,'qq.voice-preparation-started',{outboxId:row.id});
           try {
@@ -455,6 +463,9 @@ export class QqBridge {
                 wait:()=>this.waitBetweenSends(this.intervalMs),
               });
             } catch(error) {
+              // A shutdown can race with a platform send already in flight.
+              // Only a proven pre-send interruption can move the row back to pending.
+              if(error.uncertain!==false)throw error;
               if(error.suppressed&&this.deliveryPaused()){finishDelivery(this.store,row,'pending',{error:'QQ维护暂停，等待原分段接续'});break;}
               if(this.stopping){finishDelivery(this.store,row,'pending',{error:'语音投递等待下次连接接续'});continue;}
               if(error.suppressed&&!conversationDeliveryGate(this.store,row).allowed){finishDelivery(this.store,row,'suppressed',{error:error.message});continue;}

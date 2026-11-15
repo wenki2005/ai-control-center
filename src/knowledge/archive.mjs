@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, open, opendir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, opendir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { TextDecoder } from 'node:util';
 import { DOCUMENT_EXTENSIONS, extractDocumentText } from './document-reader.mjs';
 import { readStableFile } from './read-stable-file.mjs';
+import { publishArchiveBlob } from './archive-publish.mjs';
 
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
@@ -239,7 +240,10 @@ export class Archive {
       finally { await handle.close(); }
       await this.#assertArchiveRoot();
       if (!within(root, await realpath(directory))) throw new Error('Archive blob directory resolves outside the archive root');
-      await rename(temp, destination);
+      await publishArchiveBlob({source:temp,destination,hash,validate:async()=>{
+        await this.#assertArchiveRoot();
+        if (!within(root, await realpath(directory))) throw new Error('Archive blob directory resolves outside the archive root');
+      }});
     } finally {
       await rm(temp, { force: true });
     }

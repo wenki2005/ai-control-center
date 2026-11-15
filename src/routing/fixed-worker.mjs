@@ -27,9 +27,23 @@ function metadataFor(store, engine, cwd) {
 
 export function fixedWorkerSlotCount(engine) {
   if (!validEngine(engine)) throw new TypeError('Unsupported fixed worker engine');
-  // Three general seats plus one dedicated phone-control seat.
-  // Sessions are created on first assignment, then reused.
-  return engine === 'dsh' ? 3 : 1;
+  // DSH has a separate fourth seat for the phone. Ordinary seats are lazy.
+  return engine === 'workbuddy' ? 1 : 3;
+}
+
+export function isFixedWorkerSlot(engine,slot) {
+  return validEngine(engine)&&Number.isInteger(slot)&&slot>=1&&slot<=fixedWorkerSlotCount(engine)+(engine==='dsh'?1:0);
+}
+
+// Only explicit assignment phrases in the user's request can pin a seat.
+export function requestedFixedWorker(text) {
+  const request=String(text??'').normalize('NFKC');
+  const match=/^\s*(?:(?:请|麻烦|帮我)\s*)?(?:交给|派给|发给|用|让)\s*(?:(DSH|Codex|WorkBuddy)\s*(?:的\s*)?固定(?:工作)?(?:会话|席位)\s*(?:第\s*)?([一二三]|\d+)?(?:\s*(?:号|席))?|(手机专用(?:会话|席位)))/iu.exec(request);
+  if(!match)return null;
+  if(match[3])return {engine:'dsh',slot:4};
+  const engine=match[1].toLowerCase();
+  if(engine==='dsh'&&!match[2])return null;
+  return {engine,slot:({'一':1,'二':2,'三':3}[match[2]]??Number(match[2]||1))};
 }
 
 function slotCwd(workspaceRoot, engine, slot) {
@@ -47,7 +61,7 @@ function slotForPath(engine, cwd) {
 export function fixedWorkerContext({ store, engine, workspaceRoot, slot = 1 } = {}) {
   if (!validEngine(engine)) throw new TypeError('Unsupported fixed worker engine');
   if (typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) throw new TypeError('workspaceRoot is required');
-  if (!Number.isInteger(slot) || slot < 1 || (slot > fixedWorkerSlotCount(engine) && !(engine==='dsh' && slot===4))) throw new TypeError('Invalid fixed worker slot');
+  if (!isFixedWorkerSlot(engine,slot)) throw new TypeError('Invalid fixed worker slot');
   const cwd = slotCwd(workspaceRoot, engine, slot);
   const saved = metadataFor(store, engine, cwd);
   const context = { cwd, sessionId: saved?.sessionId ?? null, sourceTaskId: saved?.taskId ?? null };
@@ -70,7 +84,7 @@ export function selectFixedWorkerContext({ store, engine, workspaceRoot, preferr
 }
 
 export function fixedWorkerHasPending({ store, engine, slot, workspaceRoot } = {}) {
-  if (!validEngine(engine) || !store?.db || !workspaceRoot || !Number.isInteger(slot) || (slot>fixedWorkerSlotCount(engine)&&!(engine==='dsh'&&slot===4))) return false;
+  if (!store?.db || !workspaceRoot || !isFixedWorkerSlot(engine,slot)) return false;
   const cwd = slotCwd(workspaceRoot, engine, slot);
   return Boolean(store.db.prepare(`SELECT 1 FROM tasks t
     WHERE t.role='worker' AND t.engine=? AND t.cwd=? AND t.status IN ('queued','running','waiting')
@@ -79,9 +93,8 @@ export function fixedWorkerHasPending({ store, engine, slot, workspaceRoot } = {
 
 export function fixedWorkerSlotForTask(task, workspaceRoot) {
   if (!task?.engine || !task?.cwd || !validEngine(task.engine)) return 1;
-  for (const slot of task.engine==='dsh'?[1,2,3,4]:[1]) {
-    if (samePath(task.cwd, slotCwd(workspaceRoot, task.engine, slot))) return slot;
-  }
+  const slot=slotForPath(task.engine,task.cwd);
+  if (isFixedWorkerSlot(task.engine,slot)&&samePath(task.cwd,slotCwd(workspaceRoot,task.engine,slot))) return slot;
   return 1;
 }
 
@@ -103,7 +116,7 @@ export function rememberFixedWorker({ store, task, sessionId } = {}) {
 /** True only while a marked fixed-slot worker for this engine is active. */
 export function fixedWorkerBusy({ store, engine, slot = null, excludingTaskId = null, workspaceRoot = null } = {}) {
   if (!validEngine(engine) || !store?.db) return false;
-  if (slot !== null && (!Number.isInteger(slot) || slot < 1 || (slot>fixedWorkerSlotCount(engine)&&!(engine==='dsh'&&slot===4)))) return false;
+  if (slot !== null && !isFixedWorkerSlot(engine,slot)) return false;
   const sql = `SELECT 1 FROM tasks t
     WHERE t.role='worker' AND t.engine=? AND t.status IN ('running','waiting')
       AND (? IS NULL OR t.id<>?)

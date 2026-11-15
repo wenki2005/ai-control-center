@@ -11,6 +11,17 @@ function parseOutput(stdout){const match=String(stdout).match(/\{\s*"ok"\s*:[\s\
 export class MailMonitor {
  constructor({store,notify=()=>{},personaForNotification=()=>({}),cli='agently-cli',intervalMs=300000,dailyOnly=false,address=null,provider='agent-mail',credentialsPath='runtime/qq-mail-credentials.json',python='python',now=()=>new Date()}={}){Object.assign(this,{store,notify,personaForNotification,cli,intervalMs,dailyOnly,address,provider,credentialsPath,python,now});this.timer=null;this.busy=false;this.closed=false;this.db=store.db;this.db.exec(`CREATE TABLE IF NOT EXISTS mail_seen(messageId TEXT PRIMARY KEY,createdAt TEXT,important INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS mail_digest(day TEXT PRIMARY KEY,status TEXT,updatedAt TEXT)`);}
  settings(){return {enabled:this.store.meta('mail-monitor:enabled')!=='false',address:this.address||this.store.meta('mail-monitor:address')||'user@example.invalid',zone:ZONE,summaryTime:'19:00',dailyOnly:this.dailyOnly,intervalMinutes:this.dailyOnly?1440:this.intervalMs/60000,lastScan:this.store.meta('mail-monitor:last-scan')||null};}
+ async preview({date=day(this.now()),limit=10}={}){
+  const parsed=new Date(`${date}T00:00:00Z`);
+  if(typeof date!=='string'||!/^\d{4}-\d{2}-\d{2}$/u.test(date)||!Number.isFinite(parsed.getTime())||parsed.toISOString().slice(0,10)!==date)throw Error('请提供有效的上海日期（YYYY-MM-DD）');
+  if(!Number.isInteger(limit)||limit<1||limit>20)throw Error('邮件查询条数须为 1–20');
+  const mails=(await this.list(date)).filter(mail=>{
+   const timestamp=new Date(mail.created_at||'');
+   return Number.isFinite(timestamp.getTime())&&day(timestamp)===date;
+  }).sort((left,right)=>Date.parse(right.created_at)-Date.parse(left.created_at));
+  return {date,provider:this.provider,total:mails.length,complete:this.scanComplete!==false&&mails.length<=limit,
+   messages:mails.slice(0,limit).map(mail=>({subject:String(mail.subject||'无主题').slice(0,180),from:String(mail.from?.name||mail.from?.email||'').slice(0,120),receivedAt:mail.created_at,snippet:String(mail.snippet||'').slice(0,360)}))};
+ }
  async list(dayKey=day(this.now())){
   if(this.provider==='qq-imap'){const {stdout}=await execFileAsync(this.python,['scripts/qq-mail-list.py',this.credentialsPath,dayKey],{windowsHide:true,timeout:30000,maxBuffer:500000,env:{...process.env,PYTHONIOENCODING:'utf-8'}});const data=JSON.parse(String(stdout));if(!data.ok)throw Error('QQ IMAP 返回失败');this.scanComplete=data.data?.complete!==false;return data.data?.data||[];}
   const args=['message','+list','--dir','inbox','--limit','50','--after',dayKey];

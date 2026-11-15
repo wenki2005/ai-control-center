@@ -7,6 +7,7 @@ import WebSocket from 'ws';
 import { isAbsolute, relative, resolve, sep, join } from 'node:path';
 import { sessionDisplayName } from '../session-label.mjs';
 import {errorStrategy,retryAfterMs} from '../error-strategy.mjs';
+import {readDshSessionHeader} from './dsh-session-header.mjs';
 
 const STREAM_PATH = '/api/remote.mux';
 const RECONNECT_DELAYS_MS = Object.freeze([250, 750, 1500, 3000]);
@@ -463,6 +464,18 @@ export function createDshAdapter(options = {}) {
     record.onEvent({ type: 'progress', kind });
   }
 
+  function observeSteerReceipt(record,event) {
+    const requestId=event?.type==='user/message'?event.data?.source?.rpcId:null;
+    const receipt=typeof requestId==='string'?record.steerReceipts?.get(requestId):null;
+    if(!receipt||receipt.matched)return;
+    receipt.matched=true;
+    receipt.resolve?.(true);
+    if(receipt.late) {
+      record.steerReceipts.delete(requestId);
+      record.onEvent({type:'progress',kind:'steer-received',requestId});
+    }
+  }
+
   function handleFollowItem(record, value) {
     if (value?.type === 'assistant-stream') {
       if (awaitsPrompt(record) && !record.followPromptMatched) return;
@@ -492,11 +505,7 @@ export function createDshAdapter(options = {}) {
     const event = value.event;
     if (!event || event.seq <= record.lastSeq) return;
     record.lastSeq = event.seq;
-    if(event.type==='user/message') {
-      const rpcId=event.data?.source?.rpcId;
-      const receipt=typeof rpcId==='string'?record.steerReceipts?.get(rpcId):null;
-      if(receipt&&!receipt.matched){receipt.matched=true;receipt.resolve?.(true);}
-    }
+    observeSteerReceipt(record,event);
     if (awaitsPrompt(record) && !record.followPromptMatched) {
       // A native session can refuse a new turn before consuming user/message
       // (for example a pre-existing blocked state). Do not wait forever for
@@ -538,6 +547,15 @@ export function createDshAdapter(options = {}) {
         if (visibleText) record.text = visibleText;
       }
     } else if (event.type === 'turn/end') {
+      // DSH can finish an internal reasoning-only turn, then automatically
+      // continue the same accepted user request. It is not a visible reply.
+      // Keep following that native request instead of emitting a fake success
+      // or submitting the user's message again. Bound native empty rounds.
+      if(event.data?.reason?.kind==='completed'&&record.task?.role==='director'&&!record.text.trim()){
+        record.emptyVisibleTurns=(record.emptyVisibleTurns||0)+1;
+        if(record.emptyVisibleTurns<=3){record.onEvent({type:'progress',kind:'native-empty-turn',attempt:record.emptyVisibleTurns});return;}
+        void fail(record,new Error('DSH 连续内部回合未产生可见回复，原请求已保留，未重复提交。'));return;
+      }
       record.busy = false;
       record.terminal = true;
       const reason = event.data?.reason;
@@ -560,12 +578,7 @@ export function createDshAdapter(options = {}) {
 
   async function replaySnapshot(record, value, previousSeq) {
     let records = Array.isArray(value.records) ? value.records : [];
-    for(const item of records) {
-      const event=item?.event;
-      const rpcId=event?.type==='user/message'?event.data?.source?.rpcId:null;
-      const receipt=typeof rpcId==='string'?record.steerReceipts?.get(rpcId):null;
-      if(receipt&&!receipt.matched){receipt.matched=true;receipt.resolve?.(true);}
-    }
+    for(const item of records)observeSteerReceipt(record,item?.event);
     const cursor = value.cursor ?? -1;
     if ((record.resumeFollow || awaitsPrompt(record)) && previousSeq < 0) {
       if (awaitsPrompt(record)) {
@@ -682,9 +695,10 @@ export function createDshAdapter(options = {}) {
     }
   }
 
-  async function answerQuestion(requestId, answer) {
+  async function answerQuestion(record, requestId, answer) {
     const pending = pendingQuestions.get(requestId);
     if (!pending) return false;
+    if (pending.record !== record) throw Error('DSH 原审批已失效，请查看当前会话的审批');
     let outcome;
     if (pending.eventName === 'user-questions/request') {
       const questions = pending.request.questions ?? [];
@@ -704,8 +718,9 @@ export function createDshAdapter(options = {}) {
       outcome = { kind: 'result', value: { answers } };
     } else {
       const decision=String(answer).trim();
-      if(!/^(approve(?: once)?|accept|allow|yes|y|同意|允许|批准|通过|是|deny|reject|no|n|拒绝|不允许|否)$/i.test(decision))throw Error('请明确选择允许一次或拒绝');
-      outcome = { kind: 'result', value: /^(approve(?: once)?|accept|allow|yes|y|同意|允许|批准|通过|是)$/i.test(decision) ? 'allowed-once' : 'rejected' };
+      const allowed=/^(approve(?: once)?|accept|allow|yes|y|同意|允许(?:一次)?|批准|通过|是)$/i.test(decision);
+      if(!allowed&&!/^(deny|reject|no|n|拒绝|不允许|否)$/i.test(decision))throw Error('请明确选择允许一次或拒绝');
+      outcome = { kind: 'result', value: allowed ? 'allowed-once' : 'rejected' };
     }
     await call('$events/result', { clientId: pending.clientId, eventId: pending.eventId, outcome });
     pendingQuestions.delete(requestId);
@@ -754,7 +769,7 @@ export function createDshAdapter(options = {}) {
         record.streamIds.add(adapter.eventStream);
         if (!record.followStream) {
           record.followStream = openStream('session/follow', {
-            args: { request: { address: { kind: 'session', sessionId: record.sessionId }, assistantStream: true } },
+            args: { request: { address: { kind: 'session', sessionId: record.sessionId }, assistantStream: true,...(!record.resumeFollow&&record.lastSeq<0?{maxMessages:8}:{}) } },
           });
           record.streamIds.add(record.followStream);
         }
@@ -826,8 +841,16 @@ export function createDshAdapter(options = {}) {
         : (options.workerPreset ?? 'standard'));
       let created,fallbackFromSessionId=null;
       if (task.sessionId && !task.reconnectOnly) {
+        const lookupStarted=Date.now();let lookupMethod='cache';
         let listedCwd=sessionCwds.get(task.sessionId) || null;
+        if(!listedCwd&&options.sessionHeaderLookup){
+          lookupMethod='exact-header';
+          const lookup=()=>readDshSessionHeader({baseUrl,sessionId:task.sessionId,headers:cookie?{Cookie:cookie}:{},timeoutMs:options.sessionHeaderTimeoutMs||5000});
+          try{listedCwd=await lookup();}catch(error){if(![401,403].includes(error.httpStatus))throw error;await ensureCookie({refresh:true});listedCwd=await lookup();}
+          if(listedCwd)sessionCwds.set(task.sessionId,listedCwd);
+        }
         if(!listedCwd) {
+          lookupMethod='catalog';
           let listing;
           try { listing=await retryPreflight(()=>call('session/list',{_request:{}})); }
           catch(error){
@@ -838,6 +861,7 @@ export function createDshAdapter(options = {}) {
           listedCwd=listedSessionCwd(listing,task.sessionId);
           if(listedCwd)sessionCwds.set(task.sessionId,listedCwd);
         }
+        onEvent({type:'progress',kind:'preflight-timing',stage:'session-directory',method:lookupMethod,durationMs:Date.now()-lookupStarted});
         // API-created director sessions run in the configured director project
         // (for example D:\\qq助手), while `task.cwd` is only the Hub's runtime
         // workspace. Validate a continuation against the directory used to
@@ -990,15 +1014,21 @@ export function createDshAdapter(options = {}) {
         // ambiguous: the server may have committed before the response was lost.
         error.requestId=requestId;
         error.receipt=error.receipt==='not-received'?'not-received':'unknown';
+        // A busy director can consume the steer much later than the RPC
+        // deadline. Keep the exact receipt correlation on the current turn.
+        receipt.late=error.receipt==='unknown'&&record.task.role==='director'&&!record.terminal;
         throw error;
       } finally {
-        record.steerReceipts.delete(requestId);
+        if(!receipt.late)record.steerReceipts.delete(requestId);
       }
     },
     async respond(task, approval, answer) {
       const record = active.get(task.id);
       if (!record) throw new Error(`No live DSH session for task ${task.id}`);
-      if (await answerQuestion(String(approval.requestId ?? approval.id), answer)) return { sessionId: record.sessionId };
+      if (await answerQuestion(record, String(approval.requestId ?? approval.id), answer)) return { sessionId: record.sessionId };
+      if (['user-questions/request','approval/request'].includes(approval.raw?.eventName)) {
+        throw Error('DSH 原审批已失效，请查看原会话');
+      }
       await ensureRecordStreams(record);
       record.busy = true;
       record.terminal = false;

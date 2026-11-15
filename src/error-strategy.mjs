@@ -1,4 +1,6 @@
 // Shared decisions, not a blanket fetch wrapper. Callers must prove replay safety.
+export const codexWriterBusy = error => /\balready has an active writer\b/i.test(String(error?.message ?? error ?? ''));
+
 export function retryAfterMs(value,now=Date.now()) {
  if(value==null||String(value).trim()==='')return null;
  const text=String(value).trim();
@@ -16,7 +18,7 @@ export function errorStrategy(error,{attempt=0,now=Date.now(),random=Math.random
  else if([408,425,500,502,503,504].includes(status)){category='temporary-service';action='retry';transient=true;}
  else if(status===401||status===403||/API key.{0,15}(?:expired|invalid)|unauthorized|invalid_api_key/i.test(text)){category='authentication';action='refresh-auth';}
  else if(status===404||status===410||/session.{0,40}(?:not found|does not exist)|会话.{0,8}不存在/i.test(text)){category='missing-target';action='rediscover-target';}
- else if(status===409||status===412||/already owned by an active write handle|another.{0,15}process.{0,15}writ/i.test(text)){category='conflict';action='reconcile-state';}
+ else if(status===409||status===412||codexWriterBusy(text)||/already owned by an active write handle|another.{0,15}process.{0,15}writ/i.test(text)){category='conflict';action='reconcile-state';}
  else if(status===413){category='payload-too-large';action='reduce-payload';}
  else if([400,405,415,422].includes(status)||/invalid[_ -]?request|malformed|bad request|schema validation/i.test(text)){category='invalid-request';action='correct-request';}
  else if(/ENOTFOUND|CERT_|certificate|TLS|SSL/i.test(text)){category='configuration';action='check-connection-config';}

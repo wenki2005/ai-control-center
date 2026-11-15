@@ -20,17 +20,44 @@ export class CompanionConversation {
       expiresAt TEXT NOT NULL, lastOfferedAt TEXT
     );
     CREATE TABLE IF NOT EXISTS companion_message_batches (
-      id TEXT PRIMARY KEY, kind TEXT NOT NULL, anchorUserId INTEGER NOT NULL, createdAt TEXT NOT NULL
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL, anchorUserId INTEGER NOT NULL, createdAt TEXT NOT NULL, topicId TEXT
     );
     CREATE TABLE IF NOT EXISTS companion_message_parts (
       outboxId TEXT PRIMARY KEY, batchId TEXT NOT NULL, ordinal INTEGER NOT NULL
-    );`);
+    );
+    CREATE INDEX IF NOT EXISTS companion_message_parts_batch ON companion_message_parts(batchId,ordinal);`);
+    if (!store.db.prepare('PRAGMA table_info(companion_message_batches)').all().some(column => column.name === 'topicId')) {
+      store.db.exec('ALTER TABLE companion_message_batches ADD COLUMN topicId TEXT');
+    }
+    // A topic can be introduced in any bubble. Consume it only when the full
+    // batch has platform-confirmed sends, including after a process restart.
+    store.db.exec(`CREATE TRIGGER IF NOT EXISTS companion_topic_delivered
+      AFTER UPDATE OF status ON outbox
+      WHEN NEW.status='sent' AND OLD.status<>'sent'
+      BEGIN
+        UPDATE companion_topics SET lastOfferedAt=NEW.updatedAt
+        WHERE status='open' AND (lastOfferedAt IS NULL OR lastOfferedAt<NEW.updatedAt)
+          AND id=(
+            SELECT b.topicId FROM companion_message_parts p
+            JOIN companion_message_batches b ON b.id=p.batchId
+            WHERE p.outboxId=NEW.id AND b.kind='proactive' AND b.topicId IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM companion_message_parts sibling JOIN outbox o ON o.id=sibling.outboxId
+                WHERE sibling.batchId=b.id AND o.status<>'sent'
+              )
+          );
+      END;`);
   }
   anchor() { return this.store.db.prepare("SELECT id FROM companion_chat WHERE role='user' AND retractedAt IS NULL ORDER BY id DESC LIMIT 1").get()?.id || 0; }
-  queue(messages, key, { kind = 'proactive', anchorUserId = this.anchor() } = {}) {
+  queue(messages, key, { kind = 'proactive', anchorUserId = this.anchor(), topicId = null } = {}) {
     const parts = conversationMessages(messages);
     return this.store.transaction(() => {
-      this.store.db.prepare('INSERT OR IGNORE INTO companion_message_batches(id,kind,anchorUserId,createdAt) VALUES(?,?,?,?)').run(key, kind, anchorUserId, this.store.now());
+      const createdAt = this.store.now();
+      const topic = kind === 'proactive' && typeof topicId === 'string'
+        ? this.store.db.prepare("SELECT id FROM companion_topics WHERE id=? AND status='open' AND expiresAt>?").get(topicId, createdAt)
+        : null;
+      this.store.db.prepare('INSERT OR IGNORE INTO companion_message_batches(id,kind,anchorUserId,createdAt,topicId) VALUES(?,?,?,?,?)')
+        .run(key, kind, anchorUserId, createdAt, topic?.id ?? null);
       return parts.map((text, index) => {
         const row = this.store.enqueue(text, `${key}:bubble:${index}`);
         this.store.db.prepare('INSERT OR IGNORE INTO companion_message_parts(outboxId,batchId,ordinal) VALUES(?,?,?)').run(row.id, key, index);
@@ -42,7 +69,7 @@ export class CompanionConversation {
     return this.store.db.prepare(`SELECT id,text,kind,sourceChatId,quote,lastOfferedAt FROM companion_topics t
       WHERE status='open' AND expiresAt>? AND (lastOfferedAt IS NULL OR (kind='curiosity' AND lastOfferedAt<?))
       AND (kind='curiosity' OR EXISTS(SELECT 1 FROM companion_chat c WHERE c.id=t.sourceChatId AND c.role='user' AND c.retractedAt IS NULL AND instr(c.text,t.quote)>0))
-      ORDER BY createdAt DESC LIMIT 8`)
+      ORDER BY (kind='followup') DESC, createdAt DESC LIMIT 8`)
       .all(new Date(now).toISOString(), new Date(now - 3*86400000).toISOString());
   }
   remember(candidates, now = Date.now()) {
@@ -63,9 +90,6 @@ export class CompanionConversation {
     }
     // Topics are short-lived conversational leads, not user facts or memory.
     this.store.db.prepare("DELETE FROM companion_topics WHERE expiresAt<?").run(new Date(now - 7 * 86400000).toISOString());
-  }
-  offered(id, now = Date.now()) {
-    if (typeof id === 'string') this.store.db.prepare("UPDATE companion_topics SET lastOfferedAt=? WHERE id=? AND status='open'").run(new Date(now).toISOString(), id);
   }
   closeTopic(id) {
     if (typeof id === 'string') this.store.db.prepare("UPDATE companion_topics SET status='closed' WHERE id=?").run(id);
@@ -90,6 +114,10 @@ export function conversationDeliveryGate(store, row) {
   if (!store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='companion_message_parts'").get()) return { allowed: true };
   const batch = store.db.prepare(`SELECT b.*,p.ordinal FROM companion_message_parts p JOIN companion_message_batches b ON b.id=p.batchId WHERE p.outboxId=?`).get(row.id);
   if (!batch) return { allowed: true };
+  if (batch.kind==='proactive' && store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='gm_state'").get()
+    && store.db.prepare('SELECT enabled FROM gm_state WHERE id=1').get()?.enabled) {
+    store.notification(row.id,'suppressed','GM 游戏进行中');return {allowed:false};
+  }
   const anchor = store.db.prepare("SELECT id FROM companion_chat WHERE role='user' AND retractedAt IS NULL ORDER BY id DESC LIMIT 1").get()?.id || 0;
   const previous = store.db.prepare(`SELECT o.status FROM companion_message_parts p JOIN outbox o ON o.id=p.outboxId WHERE p.batchId=? AND p.ordinal<?`).all(batch.id, batch.ordinal);
   // Never send later bubbles past an uncertain or rejected earlier one.

@@ -1,12 +1,15 @@
 /** A report is a user-facing body, not the model's preparation notes. */
+const reportMarker = /\[(?:HUB-REPORT|中枢-汇报|HUB-汇报|中部-汇报)\]/u;
+
 export function reportBody(source) {
-  const value=String(source||'').trim(),marker='[HUB-REPORT]';
-  const index=value.indexOf(marker);
-  if(index>=0) {
+  let value = String(source || '').trim();
+  const marker = reportMarker.exec(value);
+  if (marker) {
     try {
-      const parsed=JSON.parse(value.slice(index+marker.length).trim());
-      if(!parsed||typeof parsed.text!=='string'||Object.keys(parsed).some(k=>k!=='text'))return null;
-      return reportBody(parsed.text);
+      const parsed = JSON.parse(value.slice(marker.index + marker[0].length).trim());
+      if (!parsed || typeof parsed.text !== 'string' || Object.keys(parsed).some(key => key !== 'text')) return null;
+      value = parsed.text.trim();
+      if (reportMarker.test(value)) return null;
     } catch {return null;}
   }
   if(/(?:^|\n)\s*(?:Relay:|Need (?:to )?(?:relay|summari[sz]e)|Let's (?:craft|respond)|Prioritize:|Keep \d|Summari[sz]e\b|User (?:says|asks|wants)\b)|(?:Keep|Use)\s+\d[–—-]\d\s+sentences|<\/?(?:think|analysis)>/iu.test(value))return null;

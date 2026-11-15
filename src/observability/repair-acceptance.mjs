@@ -5,7 +5,8 @@ import {requireRepairEvidence,repairBaseline} from './repair-contract.mjs';
 import {createHash} from 'node:crypto';
 import {redact} from '../redact.mjs';
 import {reloadBlockers} from '../lifecycle/release.mjs';
-import {verifyMaintenanceEvidence} from './repair-review.mjs';
+import {codexWriterRecovery,verifyMaintenanceEvidence} from './repair-review.mjs';
+import {codexWriterBusy} from '../error-strategy.mjs';
 const exec=promisify(execFile);
 const defer=message=>Object.assign(Error(message),{code:'REPAIR_DEFERRED'});
 
@@ -29,6 +30,9 @@ export function repairValidator({store,root,fetchImpl=fetch,connectionProbe=null
   if(receipt.status==='fixed'&&live.health?.release?.sourceFingerprint!==fingerprint){store.meta('specialists:reload','automatic-repair-validated');throw defer('修改已通过回归，等待安全重载后再确认生效');}
   if(/QQ|SnowLuma/i.test(result.error)&&live.health?.qq!=='online')throw Error('QQ 尚未恢复在线');
   const sourceTask=result.taskId?store.task(result.taskId):null;
+  if(codexWriterBusy(result.error)&&sourceTask?.engine==='codex'&&!codexWriterRecovery(store,result)){
+    throw Object.assign(Error('原 Codex 会话尚无解除占用后的真实完成记录。'),{code:'REPAIR_NATIVE_WRITER_BLOCKED'});
+  }
   if(/DSH|人设|记忆插件/i.test(result.error)||(sourceTask?.engine==='dsh'&&/fetch failed|TIMEOUT|ECONN|连接|超时/i.test(result.error))){
    if(live.health?.dsh!=='online')throw Error('DSH 尚未恢复在线');
    const evidence=live.health?.dshModel;

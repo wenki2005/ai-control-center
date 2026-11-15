@@ -38,6 +38,14 @@ export function createWorkBuddyAdapter(options = {}) {
   const argsPrefix = options.argsPrefix ?? [options.cliPath ?? options.binaryPath ?? DEFAULT_CLI];
   const spawn = options.spawnImpl ?? nodeSpawn;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const permissionArgs = options.fullPermissions === true
+    ? ['--tools', 'default', '--dangerously-skip-permissions']
+    : [
+      '--tools', ALLOWED_TOOLS, '--allowedTools', ALLOWED_TOOLS,
+      '--disallowedTools', DISALLOWED_TOOLS,
+      '--strict-mcp-config', '--mcp-config', EMPTY_MCP_CONFIG,
+      '--permission-mode', 'acceptEdits',
+    ];
   const active = new Map();
   let closed = false;
 
@@ -111,11 +119,7 @@ export function createWorkBuddyAdapter(options = {}) {
   function argsFor(task, sessionId) {
     return [
       '-p', '--output-format', 'stream-json', '--verbose',
-      '--tools', ALLOWED_TOOLS,
-      '--allowedTools', ALLOWED_TOOLS,
-      '--disallowedTools', DISALLOWED_TOOLS,
-      '--strict-mcp-config', '--mcp-config', EMPTY_MCP_CONFIG,
-      '--permission-mode', 'acceptEdits',
+      ...permissionArgs,
       ...(task.model ? ['--model', String(task.model)] : []),
       ...(sessionId ? ['--resume', sessionId] : []),
     ];

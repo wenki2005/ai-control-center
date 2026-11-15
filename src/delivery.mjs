@@ -1,4 +1,10 @@
+import { cleanConversationalStyle } from './speech-style-policy.mjs';
+
 const URL_RE = /(?:https?:\/\/|www\.)[^\s<>]+/giu;
+
+export function userFacingTaskText(value) {
+  return cleanConversationalStyle(String(value ?? '').replace(/(?:任务\s*(?:ID|编号|标识)\s*[:：]?\s*)?\bt-[a-f0-9][a-f0-9-]{7,}\b[。；;]?/gi,'').trim());
+}
 
 function urlSpans(text) {
   return [...text.matchAll(URL_RE)].map(match => {

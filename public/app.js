@@ -200,7 +200,7 @@
   function renderCompanionEmotion() {
     const target = $('#companion-mood'); if (!target) return;
     const emotion = state.companion?.emotion || {};
-    const labels = { calm: '平静', focused: '专注', happy: '开心', concerned: '担心', urgent: '有点急', relieved: '放心了', frustrated: '有点懊恼', sad: '低落', curious: '好奇', playful: '俏皮', affectionate: '亲近', wistful: '怀念' };
+    const labels = { calm: '平静', focused: '专注', happy: '开心', concerned: '担心', urgent: '有点急', relieved: '放心了', frustrated: '有点懊恼', sad: '低落', curious: '好奇', playful: '俏皮', affectionate: '亲近', wistful: '怀念', pouting: '有点闹别扭' };
     const mood = labels[emotion.mood] || '平静';
     target.className = `companion-mood mood-${emotion.mood || 'calm'}`;
     target.textContent = `${companion.data.persona?.name || '当前助手'} · ${mood}`;
@@ -863,6 +863,7 @@
     toggle.checked = settings.enabled !== false;
     const phoneToggle = $('#phone-autonomy-enabled');
     if (phoneToggle) phoneToggle.checked = settings.phoneAutonomyEnabled === true;
+    const workToggle=$('#work-presence-enabled');if(workToggle)workToggle.checked=settings.workPresence?.enabled!==false;
     const activeName=companion.data.persona?.name||'当前助手';
     const labels = {
       waiting: '等你安静一段时间后再考虑。',
@@ -1032,15 +1033,95 @@
       reports: '汇报由当前人设结合进度、结果和情境自然组织，不用固定模板。先说最有用的结论；失败、延迟和不确定之处讲清楚，不暴露内部编号、日志和无关附件。',
     }) }).then(data => { companion.data.behavior = data?.behavior || {}; renderBehaviorSettings(companion.data.behavior); feedback.className = 'form-feedback'; feedback.textContent = '已恢复默认行为规则。'; toast('中枢行为规则已恢复默认'); }).catch(error => { feedback.className = 'form-feedback error'; feedback.textContent = `恢复失败：${error.message}`; }).finally(() => { button.disabled = false; });
   });
-  async function loadWorkerPool(){
-    try{const data=await api('/api/workers'),list=$('#worker-pool-list');list.replaceChildren();
-      for(const worker of data.workers){const card=make('article','memory-card');card.append(make('strong','',worker.name));
-        card.append(make('p','',worker.running?`工作中 · ${worker.queued} 个任务等待`:worker.queued?`${worker.queued} 个任务等待`:`空闲${worker.hasSession?'':' · 首次派单时建立'}`));
-        if(worker.lastTopic)card.append(make('small','',`近期工作：${worker.lastTopic}`));
-        if(worker.sessionUrl){const link=make('a','','查看 DSH 会话');link.href=worker.sessionUrl;link.target='_blank';link.rel='noopener';card.append(link);}list.append(card);
-      }$('#worker-pool-status').textContent=data.policy;
-    }catch(error){$('#worker-pool-status').textContent=error.message;}
+  let workerPoolSignature='', workerPoolLoading=false, workerComposer=null;
+  function openWorkerComposer(worker,task=null) {
+    if(workerComposer?.submitting)return;
+    const identity=task?.id||`${worker.engine}:${worker.slot}`;
+    const input=$('#worker-pool-prompt');
+    if(workerComposer?.identity!==identity) {
+      workerComposer={worker,task,identity};
+      input.value='';
+    }
+    $('#worker-pool-target').textContent=`${task?'补充原任务':'指定派发'} · ${worker.name}`;
+    input.placeholder=task?'输入补充要求，沿原任务续接…':'输入新任务，席位忙时在原席排队…';
+    $('#worker-pool-submit').textContent=task?'提交补充':'派给此席';
+    $('#worker-pool-composer').hidden=false;
+    input.focus();
   }
+  function renderWorkerPool(workers) {
+    const signature=JSON.stringify(workers);
+    if(signature===workerPoolSignature)return;
+    workerPoolSignature=signature;
+    const list=$('#worker-pool-list');
+    list.replaceChildren();
+    if(!workers.length)list.append(make('p','empty-state','当前没有启用固定席位。'));
+    for(const worker of workers) {
+      const card=make('article','memory-card'),heading=make('div','task-topline');
+      const status=worker.waiting?'waiting':worker.running?'running':worker.queued?'queued':'idle';
+      heading.append(make('strong','',worker.name),make('span',`task-status ${status}`,status==='idle'?'空闲':statusText(status)));
+      card.append(heading);
+      if(worker.model)card.append(make('p','small-note',`新任务模型 · ${worker.model}`));
+      const task=worker.task?{...worker.task,engine:worker.engine,sessionTitle:worker.name}:null;
+      if(task)card.append(make('p','task-prompt',`${worker.busy?'当前':'最近'}任务 · ${task.topic}`));
+      if(worker.queued)card.append(make('p','small-note',`${worker.queued} 项排队`));
+      if(!task&&!worker.hasSession)card.append(make('p','small-note','首次派发时建立会话。'));
+      const actions=make('div','task-actions');
+      const action=(label,handler,className='text-action')=>{
+        const button=make('button',className,label);
+        button.type='button';
+        button.addEventListener('click',()=>handler(button));
+        actions.append(button);
+      };
+      action('派新任务',()=>openWorkerComposer(worker));
+      if(task) {
+        action('看任务',()=>void openTaskMonitor(task));
+        if(task.status==='waiting')action('去审批',()=>selectPage('approvals'));
+        else if(task.status!=='cancelled')action(worker.busy?'补充要求':'继续原任务',()=>openWorkerComposer(worker,task));
+        if(active(task))action('停止任务',button=>void cancelTask(task,button).then(loadWorkerPool),'text-action danger');
+      }
+      if(worker.sessionUrl) {
+        const link=make('a','text-action','打开 DSH 会话');
+        link.href=worker.sessionUrl;
+        link.target='_blank';
+        link.rel='noopener';
+        actions.append(link);
+      }
+      card.append(actions);
+      list.append(card);
+    }
+  }
+  async function loadWorkerPool() {
+    if(workerPoolLoading)return;
+    workerPoolLoading=true;
+    try {
+      const {workers}=await api('/api/workers');
+      renderWorkerPool(workers);
+      if(!workerComposer?.submitting&&!$('#worker-pool-status').textContent.startsWith('已'))$('#worker-pool-status').textContent='点名派发时，任务在所选席位等待。';
+    } catch(error) {
+      $('#worker-pool-status').textContent=error.message;
+    } finally {workerPoolLoading=false;}
+  }
+  $('#worker-pool-dismiss')?.addEventListener('click',()=>{$('#worker-pool-composer').hidden=true;});
+  $('#worker-pool-composer')?.addEventListener('submit',async event=>{
+    event.preventDefault();
+    const draft=workerComposer,input=$('#worker-pool-prompt'),button=$('#worker-pool-submit'),feedback=$('#worker-pool-status');
+    const text=input.value.trim();
+    if(!draft||draft.submitting||!text)return;
+    if(draft.text!==text){draft.text=text;draft.key=crypto.randomUUID();}
+    draft.submitting=button.disabled=input.disabled=true;
+    try {
+      const result=draft.task
+        ? await api(`/api/tasks/${encodeURIComponent(draft.task.id)}/message`,{method:'POST',body:json({text,messageKey:draft.key})})
+        : await api('/api/tasks',{method:'POST',body:json({engine:draft.worker.engine,workerSlot:draft.worker.slot,prompt:text,messageKey:'fixed-seat:'+draft.key})});
+      feedback.textContent=result.reply||(result.task.status==='queued'?`已在 ${draft.worker.name} 排队。`:`已提交给 ${draft.worker.name}。`);
+      workerComposer=null;
+      input.value='';
+      event.target.hidden=true;
+      await Promise.all([loadWorkerPool(),loadState()]);
+    } catch(error) {
+      feedback.textContent=error.message;
+    } finally {draft.submitting=button.disabled=input.disabled=false;}
+  });
   $('#worker-pool-window')?.addEventListener('toggle',event=>{if(event.target.open)void loadWorkerPool();});
   $('#worker-pool-refresh')?.addEventListener('click',()=>void loadWorkerPool());
   setInterval(()=>{if($('#worker-pool-window')?.open)void loadWorkerPool();},15000);
@@ -1173,6 +1254,11 @@
       toast(requested ? '已允许空闲时自主使用手机' : '已暂停新的手机自主探索，当前任务继续完成');
     } catch (error) { toggle.checked = !requested; toast(`更新手机自主使用设置失败：${error.message}`); }
     finally { toggle.disabled = false; }
+  });
+  $('#work-presence-enabled')?.addEventListener('change',async event=>{
+    const toggle=event.target,enabled=toggle.checked;toggle.disabled=true;
+    try{const settings=await api('/api/companion/work-presence',{method:'POST',body:json({enabled})});companion.data.proactive||={};companion.data.proactive.workPresence=settings;toast(enabled?'工作期间也会自然陪你聊几句':'已关闭工作期间陪聊');}
+    catch(error){toggle.checked=!enabled;toast(`更新陪聊设置失败：${error.message}`);}finally{toggle.disabled=false;}
   });
   $('#proactive-enabled')?.addEventListener('change', async event => {
     const toggle = event.currentTarget;
@@ -1420,6 +1506,11 @@
       if(workerSelect&&document.activeElement!==workerSelect&&!workerSelect.dataset.dirty)workerSelect.value=workerEngine;
       if(workerFeedback&&!workerSelect?.dataset.dirty)workerFeedback.textContent=`当前任务执行：${workerEngine==='auto'?'自动选择':workerEngine==='codex'?'固定 Codex':'固定 DSH 3080'}`;
       if($('#worker-engine-save'))$('#worker-engine-save').disabled=false;
+      const modelForm=$('#codex-model-form');
+      if(modelForm&&!modelForm.dataset.dirty&&data.codexModels){
+        $('#codex-director-model').value=data.codexModels.director;
+        $('#codex-worker-model').value=data.codexModels.worker;
+      }
     } catch (error) {
       $('#system-primary').textContent = '暂不可用';
       $('#system-summary').textContent = `守护状态暂不可用：${error.message}`;
@@ -1439,6 +1530,16 @@
   setInterval(()=>{if($('#agent-completion-window')?.open)void loadAgentCompletions();},15000);
   $('#agent-completion-enabled')?.addEventListener('change',async event=>{const toggle=event.target;toggle.disabled=true;try{await api('/api/agents/completions/settings',{method:'POST',body:json({enabled:toggle.checked})});await loadAgentCompletions();}catch(error){toggle.checked=!toggle.checked;toast(error.message);}finally{toggle.disabled=false;}});
   $('#worker-engine-select')?.addEventListener('change',event=>{event.target.dataset.dirty='true';$('#worker-engine-feedback').textContent='尚未保存，点击“保存任务引擎”后生效。';});
+  $('#codex-model-form')?.addEventListener('input',event=>{event.currentTarget.dataset.dirty='true';});
+  $('#codex-model-form')?.addEventListener('submit',async event=>{
+    event.preventDefault();const form=event.currentTarget,button=form.querySelector('button'),feedback=$('#codex-model-feedback');
+    button.disabled=true;
+    try{
+      await api('/api/system/codex-models',{method:'POST',body:json({director:$('#codex-director-model').value.trim(),worker:$('#codex-worker-model').value.trim()})});
+      delete form.dataset.dirty;feedback.textContent='已保存，从下一条主管消息和新派发任务生效。';
+      await loadSystem();await loadWorkerPool();
+    }catch(error){feedback.textContent=`保存失败：${error.message}`;}finally{button.disabled=false;}
+  });
   $('#worker-engine-form')?.addEventListener('submit',async event=>{
     event.preventDefault();const select=$('#worker-engine-select'),button=$('#worker-engine-save'),feedback=$('#worker-engine-feedback');button.disabled=true;
     try{const result=await api('/api/system/worker-engine',{method:'POST',body:json({engine:select.value})});delete select.dataset.dirty;select.value=result.engine;await loadSystem();toast('任务执行引擎已保存，从下一条消息生效');}

@@ -89,7 +89,7 @@ export function createDirectorTools({ defineTool, fetchImpl=fetch, baseUrl='http
       description:'结合用户原话、上下文和当前目标判断是否需要实际执行。用户用疑问、委婉、简短或承接前文的说法，也可能是在委托执行；不要用固定关键词或句式决定是否派单。单纯询问事实、解释、意见、假设讨论或闲聊由主管直接回答；若确实需要操作、调查、创作或处理，就派给二级协调会话继续选合适的工作会话。只有会影响结果的关键信息缺失时才澄清。成功后自然告诉用户工作正在安排中，不提任务编号；二级协调随后会确认实际承接的会话名称。requestId 必须使用系统消息给出的本轮主管请求幂等ID。',
       parameters:{
         requestId:{type:'string',required:true,description:'系统消息给出的本轮主管请求幂等ID'},
-        engine:{type:'string',required:true,description:'执行引擎：dsh、codex 或 workbuddy（文件读写整理）'},
+        engine:{type:'string',required:true,description:'执行引擎：dsh、codex 或 workbuddy'},
         prompt:{type:'string',required:true,description:'通常 1 至 3 句，忠实保留用户目标和明确约束；不要自行添加目录、回复篇幅或固定回话，也不要附加用户未要求的限制。'},
         project:{type:'string',description:'仅在用户指定项目或当前项目列表能明确对应时填写已有项目名；无法确定时省略。'},
         contextTaskId:{type:'string',description:'续接相关工作时填写已查到的前次任务引用，不猜编号。'},

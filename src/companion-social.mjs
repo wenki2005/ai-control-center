@@ -32,12 +32,12 @@ export class CompanionSocial {
   caller(sessionId){const task=this.store.db.prepare("SELECT * FROM tasks WHERE sessionId=? AND role='worker' AND engine='dsh' AND status='running' ORDER BY createdAt DESC LIMIT 1").get(String(sessionId));if(!task||!/(?:手机|phone|安卓)/iu.test(task.prompt))throw Error('请在持有手机操作任务的 DSH 固定工作会话调用');return task;}
   async browse({platform,goal,sessionId,requestKey}={}){if(!APPS[platform])throw Error('请选择 B站 或小黑盒');const status=await this.status();if(!status.connected)throw Error(status.message);
     if(!status.apps.find(app=>app.id===platform)?.installed)throw Error(`${APPS[platform].name} 尚未安装；可由原工作会话按 mornye-phone.md 从官方来源安装`);
-    const director=sessionId?this.store.db.prepare("SELECT * FROM tasks WHERE sessionId=? AND role='director' AND status='running' ORDER BY createdAt DESC LIMIT 1").get(String(sessionId)):null;
+    const director=sessionId?this.store.db.prepare("SELECT * FROM tasks WHERE sessionId=? AND role='coordinator' AND status='running' ORDER BY createdAt DESC LIMIT 1").get(String(sessionId)):null;
     if(sessionId&&!director)throw Error('这轮主管请求已结束，未重复派发');
     if(director&&this.hub.directorRequestedEngine(director)==='codex')throw Error('手机操作使用 DSH 工具；这条请求选择了 Codex，请改选 DSH 后再浏览');
     const goalText=String(goal||'按兴趣挑一条内容，看看正文和评论，分享真实发现').slice(0,500);
     const digest=createHash('sha256').update(platform+'\0'+goalText).digest('hex').slice(0,24);
-    const task=await this.hub.create({engine:'dsh',prompt:`用手机浏览${APPS[platform].name}：${goalText}。先读 D:/qq助手/mornye-phone.md。需要评论时用 hub_social_draft 起草，等用户确认，不直接点发布。`,role:director?'coordinator':'worker',messageKey:director?`director:${director.id}:${digest}`:`phone-social-browse:${String(requestKey||Math.floor(Date.now()/10000)).slice(0,80)}:${digest}`});
+    const task=await this.hub.create({engine:'dsh',prompt:`用手机浏览${APPS[platform].name}：${goalText}。先读 D:/qq助手/mornye-phone.md。需要评论时用 hub_social_draft 起草，等用户确认，不直接点发布。`,role:'worker',messageKey:director?`coordinator:${director.id}:${digest}`:`phone-social-browse:${String(requestKey||Math.floor(Date.now()/10000)).slice(0,80)}:${digest}`});
     return {accepted:true,sessionTitle:this.hub.sessionTitleForTask(task),status:task.status};}
   async draft({sessionId,platform,title,url='',content}={}){
     const task=this.caller(sessionId);if(!APPS[platform])throw Error('平台无效');title=String(title||'').trim();content=String(content||'').trim();

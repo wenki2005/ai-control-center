@@ -82,7 +82,29 @@ export function settleValidatedRepair(service,row){
  return true;
 }
 
+export function codexWriterRecovery(store, row) {
+ const task=store.task(row.taskId);
+ if(task?.engine!=='codex'||!task.sessionId)return null;
+ const terminal=store.db.prepare(`SELECT e.id,e.createdAt,e.type FROM events e JOIN tasks t ON t.id=e.taskId
+   WHERE t.engine='codex' AND t.sessionId=? AND e.createdAt>=? AND (
+     (e.type='completed' AND NULLIF(json_extract(e.data,'$.nativeTurnId'),'') IS NOT NULL) OR
+     (e.type='failed' AND json_extract(e.data,'$.error') LIKE '%already has an active writer%'))
+   ORDER BY e.id DESC LIMIT 1`).get(task.sessionId,row.createdAt);
+ return terminal?.type==='completed'?terminal:null;
+}
+
 export function reconcileResolvedSources(service){
+    const {store}=service;
+    for(const row of store.db.prepare("SELECT * FROM internal_repairs WHERE status='blocked' AND error LIKE '%already has an active writer%'").all()){
+      if(/用户已确认停止/.test(row.detail||''))continue;
+      const proof=codexWriterRecovery(store,row);
+      if(proof)store.transaction(()=>{
+        const ids=store.db.prepare('SELECT errorId FROM internal_repair_sources WHERE repairId=?').all(row.id).map(item=>item.errorId);
+        if(ids.length)store.clearErrors(ids,{reason:'recovered'});
+        store.db.prepare("UPDATE internal_repairs SET status='resolved',updatedAt=? WHERE id=? AND status='blocked'").run(store.now(),row.id);
+        store.event(row.taskId,'internal-repair.codex-writer-recovered',{repairId:row.id,completedEventId:proof.id});
+      });
+    }
     // A terminal completion of this exact task after this exact incident is
     // stronger evidence than a later unrelated task or HTTP/model readiness.
     for(const row of service.store.db.prepare(`SELECT r.id,r.taskId,r.error,r.status,r.detail FROM internal_repairs r JOIN tasks t ON t.id=r.taskId

@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { parseProtocolObject } from '../protocol/director-output.mjs';
 import { buildWorkHandoff } from './work-handoff.mjs';
-import {isRemoteRelayDispatch} from '../remote-supervisor.mjs';
 import {dispatchConversationText} from '../dispatch-notice-policy.mjs';
+import {isSessionContinuationError} from '../routing/session-continuation.mjs';
 
 export function supervisorDirective(text,marker) {
   const source=String(text||'');
@@ -27,6 +27,24 @@ export function supervisorDispatches(text,{partial=false}={}){
  return out;
 }
 
+// Acknowledgements are optional presentation. A repeated or malformed one
+// must not abort the work handoff that follows it.
+function supervisorAcks(text) {
+  const source=String(text||'');
+  const matches=[];
+  let consumed=0;
+  for(const marker of source.matchAll(/(?:^|\n|(?<=\}))[ \t]*(\[HUB-[A-Z-]+\])(?=\s*\{)/gu)){
+    const start=marker.index+marker[0].indexOf(marker[1]);
+    if(start<consumed)continue;
+    try {
+      const parsed=parseProtocolObject(source.slice(start),marker[1]);
+      consumed=start+parsed.end;
+      if(marker[1]==='[HUB-ACK]')matches.push({value:parsed.value,start,end:consumed});
+    } catch { /* A partial acknowledgement is not an execution error. */ }
+  }
+  return matches;
+}
+
 export function stripSupervisorDispatches(text){
  let source=String(text||'');for(const item of supervisorDispatches(source).reverse())source=source.slice(0,item.start)+source.slice(item.end);return source.trim();
 }
@@ -45,16 +63,15 @@ export async function publishSupervisorProgress(hub,task,text,{sibling=false}={}
     const value=amended.value;
     if(!value||Object.keys(value).some(key=>!['taskId','text','reply'].includes(key))||typeof value.taskId!=='string'||typeof value.text!=='string'||!value.text.trim()||value.text.length>20000)throw Error('原任务补充协议无效');
     const target=hub.store.task(value.taskId);if(!target||target.role!=='worker')throw Error('原任务补充必须引用已核对的工作任务');
-    const key=`director-amend:${task.id}:${createHash('sha256').update(value.taskId+'\0'+value.text).digest('hex')}`;
-    await hub.message(target.id,value.text,{messageKey:key,source:'supervisor'});
-    if(!hub.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.amended'").get(task.id))hub.store.event(task.id,'director.amended',{workerId:target.id});
-    return target;
+    const key=`director:${task.id}:${createHash('sha256').update(value.taskId+'\0'+value.text).digest('hex').slice(0,24)}`;
+    const prior=linkedSupervisorTask(hub,task);if(prior)return prior;
+    const context=hub.workHandoff(task)||buildWorkHandoff({store:hub.store,userText:task.prompt});
+    return hub.create({engine:'dsh',role:'coordinator',prompt:value.text,messageKey:key,handoff:{...context,amendTaskId:target.id,goal:value.text}});
   }
-  const ack=supervisorDirective(text,'[HUB-ACK]');
-  if(ack) {
-    const value=ack.value;
-    if(!value||typeof value.text!=='string'||!value.text.trim()||value.text.length>1200||/\[HUB-/u.test(value.text))throw Error('主管前台回应格式无效');
-    if(!hub.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.ack-delivered'").get(task.id)) {
+  if(!hub.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.ack-delivered'").get(task.id)) {
+    const ack=supervisorAcks(text).find(({value})=>typeof value?.text==='string'&&value.text.trim()&&value.text.length<=1200&&!/\[HUB-/u.test(value.text));
+    if(ack) {
+      const value=ack.value;
       const reply=dispatchConversationText(value.text.trim());
       hub.store.transaction(()=>{
         if(reply){hub.say(reply);hub.notification(reply,`frontdesk:${task.id}`);}
@@ -72,10 +89,6 @@ export async function publishSupervisorProgress(hub,task,text,{sibling=false}={}
   if(!dispatch)return linkedSupervisorTask(hub,task);
   const request=dispatch.value;
   if(!request||Array.isArray(request)||Object.keys(request).some(key=>!['engine','prompt','project','requestId','reply','contextTaskId'].includes(key))||!Object.hasOwn(hub.adapters,request.engine)||typeof request.prompt!=='string'||!request.prompt.trim()||request.prompt.length>20000||(request.project!==undefined&&(typeof request.project!=='string'||request.project.length>100))||(request.requestId!==undefined&&request.requestId!==task.id)||(request.reply!==undefined&&(typeof request.reply!=='string'||request.reply.length>1200))||(request.contextTaskId!==undefined&&typeof request.contextTaskId!=='string'))throw Error('主管派单协议无效');
-  if(isRemoteRelayDispatch(request.prompt)){
-    if(!hub.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.remote-tool-required'").get(task.id))hub.store.event(task.id,'director.remote-tool-required',{reason:'remote-native-operation-is-not-local-worker-task'});
-    return null;
-  }
   const digest=createHash('sha256').update(request.engine+'\0'+request.prompt.trim()).digest('hex').slice(0,24);
   const dispatchKey=`director:${task.id}:${digest}`;
   const exact=()=>hub.store.task('t-'+createHash('sha256').update(dispatchKey).digest('hex').slice(0,12));
@@ -105,7 +118,8 @@ export async function publishSupervisorProgress(hub,task,text,{sibling=false}={}
     }
     const handoff={...(request.contextTaskId?buildWorkHandoff({store:hub.store,userText:context.userRequest,goal:prompt,sourceTaskId:request.contextTaskId}):context),goal:prompt,preferredEngine:request.engine,...(request.project&&context.userRequest?.includes(request.project)?{requestedProject:request.project}:{})};
     let imagePaths=[];try{const row=hub.store.db.prepare("SELECT data FROM events WHERE taskId=? AND type='task.images' ORDER BY id DESC LIMIT 1").get(task.id);imagePaths=JSON.parse(row?.data||'{}').paths||[];}catch{}
-    coordinator=await hub.create({engine:'dsh',role:'coordinator',prompt,messageKey:dispatchKey,imagePaths,handoff,siblingDispatch:sibling});
+    try{coordinator=await hub.create({engine:'dsh',role:'coordinator',prompt,messageKey:dispatchKey,imagePaths,handoff,siblingDispatch:sibling});}
+    catch(error){if(isSessionContinuationError(error))return null;throw error;}
     hub.store.event(task.id,'director.dispatch-admitted',{coordinatorId:coordinator.id});
   }
   if(!hub.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.delegation-announced'").get(task.id)) {
@@ -113,15 +127,17 @@ export async function publishSupervisorProgress(hub,task,text,{sibling=false}={}
     const envelope=supervisorDirective(withoutAck,'[HUB-DISPATCH]');
     const outside=envelope?(withoutAck.slice(0,withoutAck.indexOf('[HUB-DISPATCH]'))+withoutAck.slice(envelope.end)).trim():'';
     const consumedText=outside&&!outside.includes('[HUB-')?outside:'';
-    const reply=dispatchConversationText(consumedText||request.reply?.trim()||'');
+    // A streamed HUB-ACK already owns this turn's conversational reply.
+    // Legacy reply fields must not send it again when dispatch arrives later.
+    const acknowledged=hub.store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='director.ack-delivered' LIMIT 1").get(task.id);
+    const reply=acknowledged?'':dispatchConversationText(consumedText||request.reply?.trim()||'');
     hub.store.transaction(()=>{if(reply){hub.say(reply);hub.notification(reply,`director-delegated:${task.id}`);}hub.store.event(task.id,'director.delegation-announced',{text:reply,consumedText,display:reply?'conversation':'task-hint',sessionName:hub.sessionTitleForTask(coordinator)});});
   }
   return coordinator;
 }
 
 export function stripSupervisorAck(text) {
-  const ack=supervisorDirective(text,'[HUB-ACK]');
-  if(!ack)return String(text||'');
-  const start=String(text).indexOf('[HUB-ACK]');
-  return (String(text).slice(0,start)+String(text).slice(ack.end)).trim();
+  let source=String(text||'');
+  for(const ack of supervisorAcks(source).reverse())source=source.slice(0,ack.start)+source.slice(ack.end);
+  return source.trim();
 }

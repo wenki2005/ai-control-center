@@ -51,7 +51,7 @@ export function reloadActivity(store, services = {}) {
   const blockers={tasks:tasks.length,approvals:approvals.length,computerActions:computerActions.length};
   for(const name of ['proactive','news','diary','dailyReview'])blockers[name]=services[name]?.running?1:0;
   const remote=services.remoteCompanion?.activity();
-  const extras={singing:services.singing?.active,qqDelivery:services.qq?.flushing,
+  const extras={workPresence:services.workPresence?.running,singing:services.singing?.active,qqDelivery:services.qq?.flushing,gm:services.gm?.busy,
     screenSharing:services.screenCompanion?.state().active,screenAnalysis:services.screenCompanion?.running,
     remoteSharing:remote?.sharing,remoteAnalysis:remote?.analyzing,
     reports:services.reports?.busy||services.reports?.announcementFlights?.size||services.reports?.narrator?.pending?.size,

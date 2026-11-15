@@ -1,5 +1,5 @@
 import {sessionDisplayName} from '../session-label.mjs';
-import {fixedWorkerSlotForTask} from '../routing/fixed-worker.mjs';
+import {fixedWorkerSlotCount,fixedWorkerSlotForTask} from '../routing/fixed-worker.mjs';
 // Snapshot-local lookup: no cache may retain stale bindings across a handoff.
 export function taskTitleLookup({store,workspaceRoot,tasks,engineName}){
  const ids=tasks.map(t=>t.id).filter(Boolean),flags=new Map(),origins=new Map(),nativeTitles=new Map();
@@ -10,5 +10,5 @@ export function taskTitleLookup({store,workspaceRoot,tasks,engineName}){
   SELECT t.id,t.engine,t.role,t.prompt,t.cwd,t.sessionId FROM wanted w JOIN tasks t ON t.rowid=(
     SELECT rowid FROM tasks WHERE role='worker' AND sessionId=w.sessionId ORDER BY createdAt,rowid LIMIT 1
   )`).all(...sessions))origins.set(row.sessionId,row);
- return task=>{if(nativeTitles.has(task?.id))return nativeTitles.get(task.id);const fixed=flags.get(task?.id);if(fixed?.has('task.fixed-worker')){const slot=fixedWorkerSlotForTask(task,workspaceRoot);return engineName(task.engine)+' · 固定工作会话'+(slot>1?' '+slot:'');}if(fixed?.has('task.fixed-dispatcher'))return '任务分发';return sessionDisplayName(origins.get(task?.sessionId)||task);};
+ return task=>{if(nativeTitles.has(task?.id))return nativeTitles.get(task.id);const fixed=flags.get(task?.id);if(fixed?.has('task.fixed-worker')){const slot=fixedWorkerSlotForTask(task,workspaceRoot);if(slot===4)return 'DSH · 手机专用会话';return engineName(task.engine)+' · 固定工作会话'+(fixedWorkerSlotCount(task.engine)>1?' '+slot:'');}if(fixed?.has('task.fixed-dispatcher'))return '任务分发';return sessionDisplayName(origins.get(task?.sessionId)||task);};
 }

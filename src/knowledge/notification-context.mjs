@@ -9,7 +9,7 @@ export function sentNotifications(db,{query='',limit=6,now=Date.now(),since=null
   const until=new Date(now).toISOString();
   const terms=[...new Set((String(query).match(/[\p{L}\p{N}]+/gu)||[]).flatMap(s=>s.length>2?[s,...Array.from({length:s.length-1},(_,i)=>s.slice(i,i+2))]:[s]))].filter(x=>x.length>=2).slice(0,24);
   const match=terms.length?' AND ('+terms.map(()=>"instr(lower(text),lower(?))>0").join(' OR ')+')':'';
-  const rows=db.prepare(`SELECT id,text,dedupe,deliveryGroup,partIndex,updatedAt FROM outbox WHERE status='sent' AND updatedAt>=? AND updatedAt<=?${match} ORDER BY updatedAt DESC,rowid DESC LIMIT 100`).all(cutoff,until,...terms);
+  const rows=db.prepare(`SELECT id,text,dedupe,deliveryGroup,partIndex,updatedAt FROM outbox WHERE status='sent' AND dedupe NOT LIKE 'gm:%' AND updatedAt>=? AND updatedAt<=?${match} ORDER BY updatedAt DESC,rowid DESC LIMIT 100`).all(cutoff,until,...terms);
   const groups=new Set(),items=[];
   for(const row of rows){
     const group=row.deliveryGroup||row.id;if(groups.has(group))continue;groups.add(group);

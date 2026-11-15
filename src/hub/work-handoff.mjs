@@ -1,4 +1,5 @@
 import { redact } from '../redact.mjs';
+import {adjacentContinuationContext,continuationRequested,independentRequest} from '../routing/session-continuation.mjs';
 
 const RETRY_WORDS=/重试|重新发|再来一次|继续|再试(?:一次)?|再发一次|重来|接着做|续做/g;
 // Exclude recognizable probes, not real user work merely containing “测试”.
@@ -19,6 +20,7 @@ function workRecord(task) {
     taskId:task.id,
     engine:task.engine,
     sessionId:task.sessionId||null,
+    cwd:task.cwd||null,
     goal:safeText(task.prompt,2000),
     status:task.status,
     result:safeText(task.result,1600),
@@ -62,21 +64,34 @@ function themeFromFollowup(text) {
   return normalize(text).replace(RETRY_WORDS,' ').replace(/(?:请|麻烦|帮我|一下|吧|可以|能不能|吗|么|呢|还是|失败|错误|问题|上次|之前)/gu,' ').trim();
 }
 /** Build a small, factual handoff from the task and conversation store. */
-export function buildWorkHandoff({store,userText='',goal='',sourceTaskId}={}) {
+export function buildWorkHandoff({store,userText='',goal='',sourceTaskId,currentTaskId,referencedTaskIds=[],referencedNativeSessions=[]}={}) {
   if(!store?.db)throw new TypeError('buildWorkHandoff requires a Store');
   const userRequest=safeText(userText,4000);
   const finalGoal=safeText(goal||userText,4000);
-  const result={userRequest,goal:finalGoal};
+  const result={userRequest,goal:finalGoal,...(independentRequest(userText)?{independent:true}:{})};
+  const retractedIds=retractedTaskIds(store);
+  const eligible=task=>isWorkRecord(task)&&!retractedIds.has(task.id)&&!store.db.prepare("SELECT 1 FROM events WHERE taskId=? AND type='task.stop-requested' LIMIT 1").get(task.id);
+  const adjacent=currentTaskId?adjacentContinuationContext(store,userText,{currentTaskId}):null;
+  const referenceIds=referencedTaskIds.length?referencedTaskIds:adjacent?.taskIds||[];
+  const referenced=referenceIds.map(id=>store.task(id)).filter(eligible);
+  const references=[...new Map(referenced.map(task=>[`${task.engine}:${task.sessionId||task.id}`,task])).values()];
+  if(!result.independent&&(continuationRequested(userText)||adjacent?.nativeTarget)){
+    const native=referencedNativeSessions.length?referencedNativeSessions:adjacent?.nativeTarget?[adjacent.nativeTarget]:adjacent?.nativeTargets||[];
+    if(native.length)result.nativeContinuationTargets=native.map(target=>({...target,source:target.source||'verified-adjacent-native-read'}));
+    if(references.length===1)result.previousWork=workRecord(references[0]);
+    else if(references.length>1)result.continuationCandidates=references.map(task=>({...workRecord(task),title:task.prompt.slice(0,80),source:'canonical-dialogue-chain'}));
+  }
   if(sourceTaskId!==undefined&&sourceTaskId!==null&&String(sourceTaskId)) {
     const retracted=retractedTaskIds(store);
     const exact=store.task(String(sourceTaskId));
-    if(exact?.role==='worker'&&!retracted.has(exact.id)&&!EXCLUDED.test(exact.prompt||''))result.previousWork=workRecord(exact);
-  } else {
+    if(!result.independent&&eligible(exact))result.previousWork=workRecord(exact);
+  } else if(!result.independent&&!result.previousWork&&!result.nativeContinuationTargets&&!result.continuationCandidates) {
     const topic=themeFromFollowup(userText||goal);
     const retry=isRetrial(userText||goal);
     if(retry&&topic) {
       const retracted=retractedTaskIds(store);
-      const workers=store.db.prepare("SELECT id,engine,sessionId,prompt,error,updatedAt FROM tasks WHERE role='worker' ORDER BY createdAt DESC").all().filter(task=>!retracted.has(task.id)&&!EXCLUDED.test(task.prompt||''));
+      const cutoff=new Date(Date.parse(store.now())-2*3600000).toISOString();
+      const workers=store.db.prepare("SELECT id,role,engine,sessionId,prompt,error,updatedAt FROM tasks WHERE role='worker' AND updatedAt>=? ORDER BY createdAt DESC").all(cutoff).filter(task=>!retracted.has(task.id)&&eligible(task));
       const scoreTopic=createWorkTopicScorer(topic);
       const ranked=workers
         .map(task=>({task,score:scoreTopic(task)}))
@@ -87,7 +102,8 @@ export function buildWorkHandoff({store,userText='',goal='',sourceTaskId}={}) {
         .sort((a,b)=>b.score-a.score||String(b.task.updatedAt||'').localeCompare(String(a.task.updatedAt||'')));
       // Continue only a clear subject match; unrelated/vague retries are not
       // forced into whichever worker happened to run last.
-      if(contexts.length===1||contexts[0]&&contexts[0].score-(contexts[1]?.score||0)>=0.15)result.previousWork=workRecord(store.task(contexts[0].task.id));
+      if(contexts.length===1)result.previousWork=workRecord(store.task(contexts[0].task.id));
+      else if(contexts.length>1)result.continuationCandidates=contexts.map(({task})=>({...workRecord(store.task(task.id)),title:task.prompt.slice(0,80),source:'recent-topic-candidate'}));
     }
   }
   return result;

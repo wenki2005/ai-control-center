@@ -52,8 +52,11 @@ export class AgentCompletions {
       WHERE t.engine='dsh' AND (t.sessionId=? OR t.sessionId=?) AND e.type IN ('completed','failed')
         AND json_extract(e.data,'$.nativeTurnId')=? LIMIT 1`).get(id,'session-'+id,String(value.turnId)))return true;
     const tasks=this.store.db.prepare('SELECT id,engine,role,status,result,error,updatedAt FROM tasks WHERE sessionId=? OR sessionId=?').all(id,'session-'+id);
-    if(tasks.some(t=>!['worker','direct'].includes(t.role)))return true;
-    if(tasks.some(t=>['queued','running','waiting','interrupted'].includes(t.status)))return true;
+    if(tasks.some(t=>!['worker','direct','codex-direct'].includes(t.role)))return true;
+    if(tasks.some(t=>t.role!=='codex-direct'&&['queued','running','waiting','interrupted'].includes(t.status)))return true;
+    if(value.engine==='codex'&&this.store.db.prepare(`SELECT 1 FROM events e JOIN tasks t ON t.id=e.taskId
+      WHERE t.role='codex-direct' AND t.sessionId=? AND e.type IN ('codex-direct.started','completed','failed')
+      AND json_extract(e.data,'$.nativeTurnId')=? LIMIT 1`).get(id,String(value.turnId)))return true;
     // Legacy failures have no native turn ID. Require the same failed outcome
     // and near-identical terminal time as well as a real sent Hub report;
     // a report from an earlier task must never suppress this session forever.
